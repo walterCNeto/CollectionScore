@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from collscore import FAIXAS
 from collscore.simulate import BASE_ROLL_MATRIX, _saldo_devedor, simulate_portfolio
@@ -8,6 +9,18 @@ def test_roll_matrix_rows_sum_to_one():
     assert np.allclose(BASE_ROLL_MATRIX.sum(axis=1), 1.0)
     assert BASE_ROLL_MATRIX.shape == (len(FAIXAS), len(FAIXAS))
     assert (BASE_ROLL_MATRIX >= 0).all()
+
+
+def test_linha_em_dia_calibrada_e_soma_um():
+    """Entrada em atraso (em_dia -> 1-15) recalibrada para 0.025/mes
+    (inadimplencia nova tipica de varejo, antes 0.05); a linha continua
+    renormalizada e somando 1.000.
+    """
+    linha_em_dia = BASE_ROLL_MATRIX[0]
+    assert linha_em_dia[1] == pytest.approx(0.025)
+    assert linha_em_dia[0] == pytest.approx(0.975)
+    assert linha_em_dia.sum() == pytest.approx(1.0)
+    assert (linha_em_dia[2:] == 0).all()
 
 
 def test_saldo_devedor_mass_conservation():

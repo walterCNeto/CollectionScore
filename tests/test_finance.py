@@ -1,13 +1,18 @@
 import pandas as pd
 import pytest
 
+import numpy as np
+
 from collscore.finance import (
     CANAL_CUSTOS,
     CANAL_POR_FAIXA,
     EFETIVIDADE_CANAL,
     SALDO_MINIMO_ELEGIVEL,
+    compare_channels,
     optimal_cutoff,
+    optimal_strategy,
     profit_curve,
+    run_finance_analysis,
 )
 
 
@@ -102,7 +107,11 @@ def test_saldo_minimo_elegivel_exclui_contratos_do_juridico():
     assert curva["caixa_incremental"].max() <= caixa_maximo_possivel + 1e-6
 
 
-def test_saldo_minimo_elegivel_zero_para_sms_e_humano():
+def test_saldo_minimo_elegivel_zero_para_canais_baratos():
+    assert SALDO_MINIMO_ELEGIVEL["sms"] == 0.0
+    assert SALDO_MINIMO_ELEGIVEL["negativacao"] == 0.0
+    assert SALDO_MINIMO_ELEGIVEL["call_center"] == 0.0
+
     df = pd.DataFrame(
         {
             "score": [0.9, 0.1],
@@ -160,3 +169,69 @@ def test_efetividade_zero_zera_caixa_incremental(caso_pequeno):
     # custo nao e afetado pela efetividade
     curva_base = profit_curve(caso_pequeno, "31-60", n_deciles=10)
     assert (curva_zero["custo_total"] == curva_base["custo_total"]).all()
+
+
+# -------------------------------------------------------- rename humano -> call_center
+
+
+def test_nenhum_canal_se_chama_humano():
+    for canal in CANAL_CUSTOS:
+        assert canal != "humano"
+    for canal in SALDO_MINIMO_ELEGIVEL:
+        assert canal != "humano"
+    for canal in EFETIVIDADE_CANAL:
+        assert canal != "humano"
+    for canal in CANAL_POR_FAIXA.values():
+        assert canal != "humano"
+    assert "call_center" in CANAL_CUSTOS
+
+
+# -------------------------------------------------------- escolha endogena de canal
+
+
+@pytest.fixture
+def book_multi_faixa() -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    n = 3000
+    faixas = rng.choice(["1-15", "16-30", "31-60", "61-90", "91-180", "180+"], size=n)
+    df = pd.DataFrame(
+        {
+            "score": rng.uniform(0, 1, n),
+            "pagou_1parcela": (rng.uniform(0, 1, n) < 0.3).astype(int),
+            "saldo_atraso": rng.uniform(100, 15_000, n),
+            "faixa_atraso": faixas,
+        }
+    )
+    df["valor_recuperado"] = df["pagou_1parcela"] * rng.uniform(50, 300, n)
+    return df
+
+
+def test_compare_channels_uma_linha_por_canal_elegivel(book_multi_faixa):
+    cc = compare_channels(book_multi_faixa, "31-60")
+    assert set(cc["canal"]) == set(CANAL_CUSTOS.keys())
+    assert len(cc) == len(CANAL_CUSTOS)
+    assert (cc["faixa_atraso"] == "31-60").all()
+
+
+def test_optimal_strategy_lucro_nao_perde_para_mapeamento_manual(book_multi_faixa):
+    """A estrategia endogena por lucro escolhe, para cada faixa, o melhor
+    canal dentre TODOS os canais -- incluindo o canal do mapeamento manual.
+    Logo o lucro total nunca pode ser menor que o do mapeamento manual.
+    """
+    _, resumo_manual = run_finance_analysis(book_multi_faixa)
+    lucro_manual = resumo_manual["lucro_max"].sum()
+
+    estrategia = optimal_strategy(book_multi_faixa, criterio="lucro")
+
+    assert estrategia["lucro_total"] >= lucro_manual - 1e-6
+    assert estrategia["criterio"] == "lucro"
+    assert not estrategia["estrategia"].empty
+
+
+def test_optimal_strategy_roi_prioriza_canais_mais_baratos(book_multi_faixa):
+    estrategia_roi = optimal_strategy(book_multi_faixa, criterio="roi")
+    estrategia_lucro = optimal_strategy(book_multi_faixa, criterio="lucro")
+
+    # otimizar por ROI tende a favorecer canais de custo baixo (ROI por
+    # unidade acionada e maior quando o denominador -- custo -- e pequeno)
+    assert estrategia_roi["roi_agregado"] >= estrategia_lucro["roi_agregado"]

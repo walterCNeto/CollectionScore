@@ -1,6 +1,7 @@
 """Pipeline ponta a ponta do collscore: simula -> features -> target
 (pagou_1parcela) -> treina modelo pooled -> metricas de regularizacao
-financeira -> financas -> relatorio.md.
+financeira -> financas (manual e estrategia endogena de canal) ->
+relatorio.md.
 
 Aplica burn-in: descarta os snapshots 0-5 (carteira ainda estabilizando a
 distribuicao de faixas apos a reposicao mensal) e treina/mede apenas nos
@@ -17,8 +18,14 @@ import numpy as np
 import pandas as pd
 
 from collscore.features import FEATURE_COLS, build_features
-from collscore.finance import run_finance_analysis
-from collscore.metrics import decile_table, model_ks_gini, resumo_regularizacao, roll_rate_saldo
+from collscore.finance import optimal_strategy, run_channel_comparison, run_finance_analysis
+from collscore.metrics import (
+    decile_table,
+    ks_gini_por_faixa,
+    model_ks_gini,
+    resumo_regularizacao,
+    roll_rate_saldo,
+)
 from collscore.model import train_pooled
 from collscore.simulate import simulate_portfolio
 from collscore.target import compute_targets
@@ -89,6 +96,7 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     curva_lucro, resumo_otimo = run_finance_analysis(test, score_col="score", target_col=TARGET_COL)
 
     ks_gini = model_ks_gini(test["score"].to_numpy(), test[TARGET_COL].to_numpy())
+    ks_gini_faixa = ks_gini_por_faixa(test, score_col="score", target_col=TARGET_COL)
 
     # tabela executiva: saldo em atraso | taxa_reg_contratos | taxa_reg_caixa | custo acionamento | ROI
     exec_fin = resumo_exec.merge(
@@ -99,6 +107,28 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     exec_fin = exec_fin[
         ["faixa_atraso", "saldo_atraso_total", "taxa_reg_contratos", "taxa_reg_caixa", "canal", "custo_total", "roi_no_corte"]
     ].rename(columns={"custo_total": "custo_acionamento", "roi_no_corte": "roi"})
+
+    print("Comparando canais e montando estrategias endogenas...")
+    comparacao_canais = run_channel_comparison(test, score_col="score", target_col=TARGET_COL)
+    estrategia_lucro = optimal_strategy(test, criterio="lucro", score_col="score", target_col=TARGET_COL)
+    estrategia_roi = optimal_strategy(test, criterio="roi", score_col="score", target_col=TARGET_COL)
+
+    totais_lado_a_lado = pd.DataFrame(
+        [
+            {
+                "criterio": "lucro",
+                "lucro_total": estrategia_lucro["lucro_total"],
+                "custo_total": estrategia_lucro["custo_total"],
+                "roi_agregado": estrategia_lucro["roi_agregado"],
+            },
+            {
+                "criterio": "roi",
+                "lucro_total": estrategia_roi["lucro_total"],
+                "custo_total": estrategia_roi["custo_total"],
+                "roi_agregado": estrategia_roi["roi_agregado"],
+            },
+        ]
+    )
 
     # --------------------------------------------------------------- relatorio
     w("# Relatorio collscore")
@@ -115,10 +145,19 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     w(
         "Saldo em atraso, taxa de regularizacao (contratos e caixa), canal, "
         "custo de acionamento e ROI no corte otimo (linha TOTAL sem canal/custo/ROI, "
-        "pois a estrategia e definida por faixa)."
+        "pois a estrategia e definida por faixa; canal/custo/ROI aqui seguem o "
+        "mapeamento MANUAL de `CANAL_POR_FAIXA` -- ver secao (f) para a estrategia "
+        "endogena de canal)."
     )
     w()
     w(md_table(exec_fin))
+    w(
+        "**Definicao:** caixa recuperado = 1 parcela x evento `pagou_1parcela`; "
+        "`taxa_reg_caixa` e estruturalmente decrescente com a faixa (o estoque em "
+        "atraso acumula multiplas parcelas, enquanto o caixa recuperado por evento "
+        "continua valendo so 1 parcela)."
+    )
+    w()
 
     w("## (b) Roll rate de saldo M -> M+1")
     w()
@@ -130,7 +169,7 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     w()
     w(md_table(dec_contrato))
 
-    w("## (d) Curva de lucro e corte otimo por canal (com piso de saldo elegivel)")
+    w("## (d) Curva de lucro e corte otimo por canal (mapeamento manual, com piso de saldo elegivel)")
     w()
     w("Curva completa (lucro acumulado por numero de decis acionados):")
     w()
@@ -138,10 +177,38 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     w("Corte otimo por faixa/canal (maximiza lucro):")
     w()
     w(md_table(resumo_otimo))
+    w(
+        "O score define corte apenas onde o custo de acionamento e material "
+        "(juridico); nos canais baratos ele apenas ordena a fila."
+    )
+    w()
 
-    w("## (e) KS / Gini globais do modelo (conjunto de teste)")
+    w("## (e) KS / Gini do modelo (conjunto de teste)")
+    w()
+    w("Global (mistura faixas com taxas de evento bem diferentes -- infla o numero em relacao ao poder discriminante dentro de cada faixa):")
     w()
     w(md_table(ks_gini))
+    w("Por faixa (mesmo score, sem retreinar nada por faixa):")
+    w()
+    w(md_table(ks_gini_faixa))
+
+    w("## (f) Escolha endogena de canal: comparacao e estrategias otimas")
+    w()
+    w(
+        "Comparacao canal x faixa: para cada faixa, o resultado de aciona-la por "
+        "CADA canal elegivel (independente do mapeamento fixo de (a)/(d))."
+    )
+    w()
+    w(md_table(comparacao_canais))
+    w("Totais das duas estrategias endogenas, lado a lado:")
+    w()
+    w(md_table(totais_lado_a_lado))
+    w("Estrategia otima por lucro (canal vencedor por faixa):")
+    w()
+    w(md_table(estrategia_lucro["estrategia"]))
+    w("Estrategia otima por ROI (canal vencedor por faixa):")
+    w()
+    w(md_table(estrategia_roi["estrategia"]))
 
     with open(output, "w", encoding="utf-8") as f:
         f.write(buf.getvalue())

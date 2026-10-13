@@ -2,7 +2,7 @@
 
 Dado um book escorado (score de `pagou_1parcela` por contrato), simula o
 resultado de acionar os top decis de cada faixa de atraso atraves de um
-canal de custo crescente (sms -> negativacao -> humano -> juridico), e
+canal de custo crescente (sms -> negativacao -> call_center -> juridico), e
 deriva a curva de lucro L(corte) = caixa incremental - custo de
 acionamento, o corte otimo por faixa/canal e o ROI da estrategia.
 
@@ -23,13 +23,20 @@ suficientes para uma modelagem causal de uplift por canal (ver o flag
 Por padrao a baseline de self-cure e estimada como uma fracao
 (`baseline_self_cure_pct`) da taxa de regularizacao observada, aplicada
 apenas as faixas iniciais de atraso (<=30 dias).
+
+Alem do mapeamento fixo faixa->canal (`CANAL_POR_FAIXA`, modo "manual"),
+este modulo oferece uma escolha ENDOGENA de canal: `compare_channels`
+testa, para uma faixa, todos os canais elegiveis (independente do
+mapeamento fixo) e `optimal_strategy` escolhe por faixa o canal vencedor
+segundo um criterio (lucro ou ROI no corte otimo), compondo a estrategia
+completa e seus totais.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-CANAL_CUSTOS = {"sms": 0.15, "negativacao": 3.00, "humano": 8.00, "juridico": 150.00}
+CANAL_CUSTOS = {"sms": 0.15, "negativacao": 3.00, "call_center": 8.00, "juridico": 150.00}
 
 CANAL_POR_FAIXA = {
     "em_dia": None,
@@ -41,9 +48,9 @@ CANAL_POR_FAIXA = {
     "180+": "juridico",
 }
 
-SALDO_MINIMO_ELEGIVEL = {"sms": 0.0, "negativacao": 0.0, "humano": 0.0, "juridico": 5000.00}
+SALDO_MINIMO_ELEGIVEL = {"sms": 0.0, "negativacao": 0.0, "call_center": 0.0, "juridico": 5000.00}
 
-EFETIVIDADE_CANAL = {"sms": 0.40, "negativacao": 0.65, "humano": 1.00, "juridico": 1.00}
+EFETIVIDADE_CANAL = {"sms": 0.40, "negativacao": 0.65, "call_center": 1.00, "juridico": 1.00}
 
 FAIXAS_SELF_CURE = ("1-15", "16-30")
 BASELINE_SELF_CURE_PCT = 0.30
@@ -168,7 +175,8 @@ def run_finance_analysis(
     **kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Roda `profit_curve` + `optimal_cutoff` para cada faixa de atraso
-    delinquente presente em `df`. Retorna (curva_completa, resumo_por_faixa).
+    delinquente presente em `df`, usando o canal fixo de `canal_por_faixa`
+    (modo "manual"). Retorna (curva_completa, resumo_por_faixa).
     """
     faixas = [f for f in df[faixa_col].dropna().unique() if f != "em_dia"]
     curvas = []
@@ -192,3 +200,161 @@ def run_finance_analysis(
     curva_completa = pd.concat(curvas, ignore_index=True) if curvas else pd.DataFrame()
     resumo_df = pd.DataFrame(resumos)
     return curva_completa, resumo_df
+
+
+# --------------------------------------------------------------------------- escolha endogena de canal
+
+
+def compare_channels(
+    df: pd.DataFrame,
+    faixa: str,
+    score_col: str = "score",
+    target_col: str = "pagou_1parcela",
+    saldo_col: str = "saldo_atraso",
+    valor_recuperado_col: str | None = "valor_recuperado",
+    faixa_col: str = "faixa_atraso",
+    canal_custos: dict | None = None,
+    efetividade_canal: dict | None = None,
+    saldo_minimo_elegivel: dict | None = None,
+    n_deciles: int = 10,
+) -> pd.DataFrame:
+    """Compara, para UMA faixa de atraso, o resultado de aciona-la por CADA
+    canal elegivel (todos os canais definidos em `canal_custos`),
+    independente do mapeamento fixo `CANAL_POR_FAIXA`. Para cada canal, roda
+    `profit_curve` e extrai o corte que maximiza o lucro (`optimal_cutoff`).
+
+    Retorna uma linha por canal com: faixa_atraso, canal, decis_otimo,
+    n_contratos, custo, lucro_max, roi_no_corte.
+    """
+    canal_custos = canal_custos or CANAL_CUSTOS
+    efetividade_canal = efetividade_canal or EFETIVIDADE_CANAL
+    saldo_minimo_elegivel = saldo_minimo_elegivel or SALDO_MINIMO_ELEGIVEL
+
+    linhas = []
+    for canal in canal_custos:
+        curva = profit_curve(
+            df,
+            faixa,
+            score_col=score_col,
+            target_col=target_col,
+            saldo_col=saldo_col,
+            valor_recuperado_col=valor_recuperado_col,
+            faixa_col=faixa_col,
+            canal_custos=canal_custos,
+            canal_por_faixa={faixa: canal},
+            saldo_minimo_elegivel=saldo_minimo_elegivel,
+            efetividade_canal=efetividade_canal,
+            n_deciles=n_deciles,
+        )
+        if curva.empty:
+            continue
+        melhor = optimal_cutoff(curva)
+        linhas.append(
+            {
+                "faixa_atraso": faixa,
+                "canal": canal,
+                "decis_otimo": melhor["decis_acionados_otimo"],
+                "n_contratos": melhor["n_contratos_otimo"],
+                "custo": melhor["custo_total"],
+                "lucro_max": melhor["lucro_max"],
+                "roi_no_corte": melhor["roi_no_corte"],
+            }
+        )
+    return pd.DataFrame(linhas)
+
+
+def run_channel_comparison(
+    df: pd.DataFrame,
+    score_col: str = "score",
+    target_col: str = "pagou_1parcela",
+    saldo_col: str = "saldo_atraso",
+    valor_recuperado_col: str | None = "valor_recuperado",
+    faixa_col: str = "faixa_atraso",
+    **kwargs,
+) -> pd.DataFrame:
+    """Roda `compare_channels` para cada faixa de atraso delinquente
+    presente em `df`. Retorna a tabela comparativa canal x faixa completa.
+    """
+    faixas = [f for f in df[faixa_col].dropna().unique() if f != "em_dia"]
+    tabelas = [
+        compare_channels(
+            df,
+            faixa,
+            score_col=score_col,
+            target_col=target_col,
+            saldo_col=saldo_col,
+            valor_recuperado_col=valor_recuperado_col,
+            faixa_col=faixa_col,
+            **kwargs,
+        )
+        for faixa in faixas
+    ]
+    tabelas = [t for t in tabelas if not t.empty]
+    return pd.concat(tabelas, ignore_index=True) if tabelas else pd.DataFrame()
+
+
+def optimal_strategy(
+    df: pd.DataFrame,
+    criterio: str = "lucro",
+    score_col: str = "score",
+    target_col: str = "pagou_1parcela",
+    saldo_col: str = "saldo_atraso",
+    valor_recuperado_col: str | None = "valor_recuperado",
+    faixa_col: str = "faixa_atraso",
+    **kwargs,
+) -> dict:
+    """Escolhe, para cada faixa, o canal vencedor segundo `criterio`
+    ("lucro" maximiza `lucro_max`, "roi" maximiza `roi_no_corte`) dentre
+    todos os canais comparados por `run_channel_comparison`.
+
+    Retorna um dict com `estrategia` (DataFrame faixa -> canal escolhido,
+    corte, custo, lucro, ROI), `criterio`, `lucro_total`, `custo_total` e
+    `roi_agregado` (caixa incremental total / custo total da estrategia).
+    """
+    if criterio not in ("lucro", "roi"):
+        raise ValueError("criterio deve ser 'lucro' ou 'roi'")
+
+    comparacao = run_channel_comparison(
+        df,
+        score_col=score_col,
+        target_col=target_col,
+        saldo_col=saldo_col,
+        valor_recuperado_col=valor_recuperado_col,
+        faixa_col=faixa_col,
+        **kwargs,
+    )
+    if comparacao.empty:
+        return {
+            "estrategia": pd.DataFrame(),
+            "criterio": criterio,
+            "lucro_total": 0.0,
+            "custo_total": 0.0,
+            "roi_agregado": float("nan"),
+        }
+
+    coluna_criterio = "lucro_max" if criterio == "lucro" else "roi_no_corte"
+    comp = comparacao.dropna(subset=[coluna_criterio])
+    if comp.empty:
+        return {
+            "estrategia": pd.DataFrame(),
+            "criterio": criterio,
+            "lucro_total": 0.0,
+            "custo_total": 0.0,
+            "roi_agregado": float("nan"),
+        }
+
+    idx_vencedores = comp.groupby(faixa_col)[coluna_criterio].idxmax()
+    estrategia = comp.loc[idx_vencedores].sort_values(faixa_col).reset_index(drop=True)
+
+    lucro_total = float(estrategia["lucro_max"].sum())
+    custo_total = float(estrategia["custo"].sum())
+    caixa_incremental_total = lucro_total + custo_total
+    roi_agregado = caixa_incremental_total / custo_total if custo_total > 0 else float("nan")
+
+    return {
+        "estrategia": estrategia,
+        "criterio": criterio,
+        "lucro_total": round(lucro_total, 3),
+        "custo_total": round(custo_total, 3),
+        "roi_agregado": round(roi_agregado, 3) if not np.isnan(roi_agregado) else float("nan"),
+    }

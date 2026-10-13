@@ -3,7 +3,13 @@ import pandas as pd
 import pytest
 
 from collscore import FAIXAS
-from collscore.metrics import decile_table, model_ks_gini, resumo_regularizacao, roll_rate_saldo
+from collscore.metrics import (
+    decile_table,
+    ks_gini_por_faixa,
+    model_ks_gini,
+    resumo_regularizacao,
+    roll_rate_saldo,
+)
 
 
 def test_roll_rate_saldo_rows_sum_to_one(panel_small):
@@ -51,6 +57,24 @@ def test_model_ks_gini_single_row():
     assert len(out) == 1
     assert {"n", "ks", "gini"} <= set(out.columns)
     assert out.loc[0, "gini"] > 0
+
+
+def test_ks_gini_por_faixa_uma_linha_por_faixa_no_teste():
+    rng = np.random.default_rng(2)
+    faixas_presentes = ["1-15", "16-30", "31-60"]
+    n = 600
+    score = rng.uniform(0, 1, n)
+    target = (rng.uniform(0, 1, n) < score).astype(int)
+    faixa_atraso = rng.choice(faixas_presentes, size=n)
+    df = pd.DataFrame({"score": score, "pagou_1parcela": target, "faixa_atraso": faixa_atraso})
+
+    out = ks_gini_por_faixa(df)
+
+    assert len(out) == len(faixas_presentes)
+    assert set(out["faixa_atraso"]) == set(faixas_presentes)
+    assert out["n"].sum() == n
+    assert (out["ks"].dropna() >= 0).all() and (out["ks"].dropna() <= 1).all()
+    assert (out["gini"].dropna() >= -1).all() and (out["gini"].dropna() <= 1).all()
 
 
 def test_decile_table_ordered_by_score_descending():

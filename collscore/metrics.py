@@ -155,9 +155,50 @@ def _auc_score(score: np.ndarray, target: np.ndarray) -> float:
 def model_ks_gini(score: np.ndarray, target: np.ndarray) -> pd.DataFrame:
     """KS e Gini globais do score (uma linha), unica avaliacao reportada do
     modelo pooled.
+
+    Atencao: o KS/Gini GLOBAL mistura contratos de faixas de atraso muito
+    diferentes, cuja taxa de evento de base ja varia bastante entre si; essa
+    separacao inter-faixa INFLA o KS/Gini global em relacao ao poder
+    discriminante do score DENTRO de cada faixa (ver `ks_gini_por_faixa`).
     """
     auc = _auc_score(score, target)
     gini = 2 * auc - 1 if not np.isnan(auc) else float("nan")
     ks = _ks_statistic(score, target)
     n = int(pd.Series(target).notna().sum())
     return pd.DataFrame([{"n": n, "ks": _round(ks), "gini": _round(gini)}])
+
+
+def ks_gini_por_faixa(
+    df: pd.DataFrame,
+    score_col: str = "score",
+    target_col: str = "pagou_1parcela",
+    faixa_col: str = "faixa_atraso",
+) -> pd.DataFrame:
+    """KS e Gini do MESMO score pooled, calculados separadamente DENTRO de
+    cada faixa de atraso (sem treinar nenhum modelo novo por faixa). Uma
+    linha por faixa presente em `df`.
+
+    O KS/Gini global (`model_ks_gini`) e tipicamente maior que qualquer um
+    destes, porque parte do seu poder discriminante vem simplesmente de
+    separar faixas com taxas de evento muito diferentes -- o que nao reflete
+    a capacidade do score de ordenar contratos DENTRO de uma mesma faixa.
+    """
+    linhas = []
+    for faixa, sub in df.groupby(faixa_col):
+        sub_valid = sub.dropna(subset=[score_col, target_col])
+        auc = _auc_score(sub_valid[score_col].to_numpy(), sub_valid[target_col].to_numpy())
+        gini = 2 * auc - 1 if not np.isnan(auc) else float("nan")
+        ks = _ks_statistic(sub_valid[score_col].to_numpy(), sub_valid[target_col].to_numpy())
+        linhas.append(
+            {
+                faixa_col: faixa,
+                "n": len(sub_valid),
+                "ks": _round(ks) if not np.isnan(ks) else float("nan"),
+                "gini": _round(gini) if not np.isnan(gini) else float("nan"),
+            }
+        )
+
+    ordem = {f: i for i, f in enumerate(FAIXAS)}
+    out = pd.DataFrame(linhas)
+    out["_ordem"] = out[faixa_col].map(lambda f: ordem.get(f, len(FAIXAS)))
+    return out.sort_values("_ordem").drop(columns="_ordem").reset_index(drop=True)

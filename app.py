@@ -20,9 +20,17 @@ from collscore.finance import (
     CANAL_POR_FAIXA,
     EFETIVIDADE_CANAL,
     SALDO_MINIMO_ELEGIVEL,
+    optimal_strategy,
+    run_channel_comparison,
     run_finance_analysis,
 )
-from collscore.metrics import decile_table, model_ks_gini, resumo_regularizacao, roll_rate_saldo
+from collscore.metrics import (
+    decile_table,
+    ks_gini_por_faixa,
+    model_ks_gini,
+    resumo_regularizacao,
+    roll_rate_saldo,
+)
 from collscore.model import train_pooled
 from collscore.simulate import FAIXA_DIAS_MEDIO, simulate_portfolio
 from collscore.target import compute_targets
@@ -200,6 +208,7 @@ def _montar_pipeline(panel: pd.DataFrame, burn_in: int, seed: int) -> dict:
     resumo_exec = resumo_regularizacao(book_elegivel, target_col=TARGET_COL)
     rr_saldo = roll_rate_saldo(panel_pos_burnin)
     ks_gini = model_ks_gini(test["score"].to_numpy(), test[TARGET_COL].to_numpy())
+    ks_gini_faixa = ks_gini_por_faixa(test, score_col="score", target_col=TARGET_COL)
     dec = decile_table(
         test["score"].to_numpy(),
         test[TARGET_COL].to_numpy(),
@@ -211,6 +220,7 @@ def _montar_pipeline(panel: pd.DataFrame, burn_in: int, seed: int) -> dict:
         resumo_exec=resumo_exec,
         rr_saldo=rr_saldo,
         ks_gini=ks_gini,
+        ks_gini_faixa=ks_gini_faixa,
         decile=dec,
         test=test,
         n_train=len(train),
@@ -293,12 +303,27 @@ for canal, default in CANAL_CUSTOS.items():
         f"Custo {canal} (R$)", min_value=0.0, value=float(default), step=0.01, format="%.3f", key=f"custo_{canal}"
     )
 
-st.sidebar.subheader("Canal por faixa")
+st.sidebar.subheader("Estrategia de canal")
+estrategia_modo = st.sidebar.radio(
+    "Estrategia de canal",
+    [
+        "Automatica (maximizar lucro)",
+        "Automatica (maximizar ROI)",
+        "Manual (mapeamento por faixa)",
+    ],
+    label_visibility="collapsed",
+)
+
 canal_por_faixa = {"em_dia": None}
-for faixa in FAIXAS_DELINQUENTES:
-    default_canal = CANAL_POR_FAIXA.get(faixa, "sms")
-    canal_por_faixa[faixa] = st.sidebar.selectbox(
-        f"Faixa {faixa}", CANAIS, index=CANAIS.index(default_canal), key=f"canal_{faixa}"
+if estrategia_modo == "Manual (mapeamento por faixa)":
+    for faixa in FAIXAS_DELINQUENTES:
+        default_canal = CANAL_POR_FAIXA.get(faixa, "sms")
+        canal_por_faixa[faixa] = st.sidebar.selectbox(
+            f"Faixa {faixa}", CANAIS, index=CANAIS.index(default_canal), key=f"canal_{faixa}"
+        )
+else:
+    st.sidebar.caption(
+        "Canal escolhido automaticamente por faixa (ver aba Estrategia financeira)."
     )
 
 st.sidebar.subheader("Saldo minimo elegivel")
@@ -342,6 +367,7 @@ if pipeline is None:
 resumo_exec = pipeline["resumo_exec"]
 rr_saldo = pipeline["rr_saldo"]
 ks_gini = pipeline["ks_gini"]
+ks_gini_faixa = pipeline["ks_gini_faixa"]
 dec = pipeline["decile"]
 test = pipeline["test"]
 
@@ -389,6 +415,14 @@ with tab3:
     c1.metric("KS", f"{ks_gini.loc[0, 'ks']:.3f}")
     c2.metric("Gini", f"{ks_gini.loc[0, 'gini']:.3f}")
     c3.metric("n (teste)", f"{int(ks_gini.loc[0, 'n'])}")
+    st.caption(
+        "O KS/Gini GLOBAL mistura faixas com taxas de evento bem diferentes -- isso "
+        "infla o numero em relacao ao poder discriminante do score DENTRO de cada "
+        "faixa. Veja a quebra por faixa abaixo."
+    )
+
+    st.subheader("KS / Gini por faixa (mesmo score, sem retreinar)")
+    st.dataframe(fmt3(ks_gini_faixa), width="stretch", hide_index=True)
 
     st.subheader("Tabela de decis (conjunto de teste)")
     st.dataframe(fmt3(dec), width="stretch", hide_index=True)
@@ -408,25 +442,127 @@ with tab3:
 
 # ---------------------------------------------------------------- tab 4: estrategia financeira
 with tab4:
-    st.subheader("Curva de lucro e corte otimo por faixa/canal")
     st.caption(
         "Negativacao modela a inclusao em bureau de credito (Serasa/SPC). Por lei "
         "(CDC, art. 43) e exigida notificacao previa ao devedor antes da inclusao -- "
         "o custo default do canal ja embute essa notificacao."
     )
+    st.caption(
+        "As efetividades por canal sao calibracoes arbitradas (nao estimadas de dados) "
+        "e a comparacao abaixo e entre canais PUROS -- reguas reais de cobranca sao "
+        "sequenciais (sms, depois negativacao, depois call_center/juridico). As "
+        "conclusoes de qual canal vence podem se inverter com outras efetividades: "
+        "use a secao 'Efetividade por canal' na sidebar para uma analise de "
+        "sensibilidade."
+    )
+
+    # ------------------------------------------------- comparacao canal x faixa
+    st.subheader("Comparacao de canais por faixa")
+
+    comparacao = run_channel_comparison(
+        test,
+        score_col="score",
+        target_col=TARGET_COL,
+        canal_custos=canal_custos,
+        saldo_minimo_elegivel=saldo_minimo_elegivel,
+        efetividade_canal=efetividade_canal,
+    )
+
+    if comparacao.empty:
+        st.warning("Nenhuma faixa teve populacao elegivel para comparar canais com os parametros atuais.")
+    else:
+        idx_lucro = comparacao.groupby("faixa_atraso")["lucro_max"].idxmax()
+        vencedores_lucro = set(
+            zip(comparacao.loc[idx_lucro, "faixa_atraso"], comparacao.loc[idx_lucro, "canal"])
+        )
+
+        comp_roi = comparacao.dropna(subset=["roi_no_corte"])
+        if not comp_roi.empty:
+            idx_roi = comp_roi.groupby("faixa_atraso")["roi_no_corte"].idxmax()
+            vencedores_roi = set(
+                zip(comp_roi.loc[idx_roi, "faixa_atraso"], comp_roi.loc[idx_roi, "canal"])
+            )
+        else:
+            vencedores_roi = set()
+
+        comp_display = fmt3(comparacao)
+        chaves = list(zip(comp_display["faixa_atraso"], comp_display["canal"]))
+        comp_display = comp_display.assign(
+            vencedor_lucro=[chave in vencedores_lucro for chave in chaves],
+            vencedor_roi=[chave in vencedores_roi for chave in chaves],
+        )
+        st.dataframe(comp_display, width="stretch", hide_index=True)
+
+    # ------------------------------------------------------------- estrategia
+    st.subheader("Estrategia escolhida")
+
+    if estrategia_modo == "Manual (mapeamento por faixa)":
+        canal_por_faixa_efetivo = canal_por_faixa
+    else:
+        criterio = "lucro" if "lucro" in estrategia_modo else "roi"
+        resultado_estrategia = optimal_strategy(
+            test,
+            criterio=criterio,
+            score_col="score",
+            target_col=TARGET_COL,
+            canal_custos=canal_custos,
+            saldo_minimo_elegivel=saldo_minimo_elegivel,
+            efetividade_canal=efetividade_canal,
+        )
+        estrategia_df = resultado_estrategia["estrategia"]
+        canal_por_faixa_efetivo = {"em_dia": None, **dict(zip(estrategia_df["faixa_atraso"], estrategia_df["canal"]))}
 
     curva_lucro, resumo_otimo = run_finance_analysis(
         test,
         score_col="score",
         target_col=TARGET_COL,
         canal_custos=canal_custos,
-        canal_por_faixa=canal_por_faixa,
+        canal_por_faixa=canal_por_faixa_efetivo,
         saldo_minimo_elegivel=saldo_minimo_elegivel,
         efetividade_canal=efetividade_canal,
     )
 
-    if curva_lucro.empty:
+    if resumo_otimo.empty:
         st.warning("Nenhuma faixa teve populacao elegivel para acionamento com os parametros atuais.")
+    else:
+        lucro_total = resumo_otimo["lucro_max"].sum()
+        custo_total_estrategia = resumo_otimo["custo_total"].sum()
+        caixa_incremental_total = lucro_total + custo_total_estrategia
+        roi_agregado = (
+            caixa_incremental_total / custo_total_estrategia if custo_total_estrategia > 0 else float("nan")
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Lucro total", f"R$ {lucro_total:,.3f}")
+        c2.metric("Custo total", f"R$ {custo_total_estrategia:,.3f}")
+        c3.metric("ROI agregado", f"{roi_agregado:.3f}")
+
+        st.dataframe(fmt3(resumo_otimo), width="stretch", hide_index=True)
+
+        juridico = resumo_otimo[resumo_otimo["canal"] == "juridico"]
+        baratos = resumo_otimo[resumo_otimo["canal"] != "juridico"]
+
+        partes = []
+        if not juridico.empty:
+            cortes = ", ".join(
+                f"{row['faixa_atraso']} ({row['decis_acionados_otimo']}/10)"
+                for _, row in juridico.iterrows()
+            )
+            partes.append(f"o score define corte apenas onde o custo de acionamento e material (juridico): {cortes}")
+        if not baratos.empty:
+            cortes = ", ".join(
+                f"{row['faixa_atraso']} ({row['decis_acionados_otimo']}/10)"
+                for _, row in baratos.iterrows()
+            )
+            partes.append(f"nos canais baratos ele apenas ordena a fila: {cortes}")
+
+        if partes:
+            st.info(" ; ".join(partes).capitalize() + ".")
+
+    # ----------------------------------------------------- curva de lucro (grafico)
+    st.subheader("Curva de lucro (estrategia aplicada)")
+    if curva_lucro.empty:
+        st.warning("Sem curva disponivel para os parametros atuais.")
     else:
         fig, ax = plt.subplots(figsize=(8, 4.5))
         for faixa, sub in curva_lucro.groupby("faixa_atraso"):
@@ -437,30 +573,6 @@ with tab4:
         ax.legend(title="Faixa")
         ax.set_title("Lucro acumulado x decis acionados")
         st.pyplot(fig)
-
-        st.subheader("Corte otimo por faixa/canal")
-        st.dataframe(fmt3(resumo_otimo), width="stretch", hide_index=True)
-
-        if not resumo_otimo.empty:
-            juridico = resumo_otimo[resumo_otimo["canal"] == "juridico"]
-            baratos = resumo_otimo[resumo_otimo["canal"] != "juridico"]
-
-            partes = []
-            if not juridico.empty:
-                cortes = ", ".join(
-                    f"{row['faixa_atraso']} ({row['decis_acionados_otimo']}/10)"
-                    for _, row in juridico.iterrows()
-                )
-                partes.append(f"no juridico o score **corta** a fila: {cortes}")
-            if not baratos.empty:
-                cortes = ", ".join(
-                    f"{row['faixa_atraso']} ({row['decis_acionados_otimo']}/10)"
-                    for _, row in baratos.iterrows()
-                )
-                partes.append(f"nos canais baratos o score **so ordena** a fila: {cortes}")
-
-            if partes:
-                st.info(" ; ".join(partes).capitalize() + ".")
 
         st.subheader("Curva completa")
         st.dataframe(fmt3(curva_lucro), width="stretch", hide_index=True)

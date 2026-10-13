@@ -62,7 +62,9 @@ FAIXA_DIAS_MEDIO = {
 BASE_ROLL_MATRIX = np.array(
     [
         # em_dia -> em_dia, 1-15, 16-30, 31-60, 61-90, 91-180, 180+
-        [0.95, 0.05, 0.00, 0.00, 0.00, 0.00, 0.00],
+        # entrada em atraso calibrada para ~0.025/mes (inadimplencia nova
+        # tipica de varejo), linha renormalizada para somar 1.
+        [0.975, 0.025, 0.00, 0.00, 0.00, 0.00, 0.00],
         # 1-15
         [0.35, 0.25, 0.40, 0.00, 0.00, 0.00, 0.00],
         # 16-30
