@@ -15,7 +15,13 @@ import streamlit as st
 
 from collscore import FAIXAS
 from collscore.features import FEATURE_COLS, build_features
-from collscore.finance import CANAL_CUSTOS, CANAL_POR_FAIXA, SALDO_MINIMO_ELEGIVEL, run_finance_analysis
+from collscore.finance import (
+    CANAL_CUSTOS,
+    CANAL_POR_FAIXA,
+    EFETIVIDADE_CANAL,
+    SALDO_MINIMO_ELEGIVEL,
+    run_finance_analysis,
+)
 from collscore.metrics import decile_table, model_ks_gini, resumo_regularizacao, roll_rate_saldo
 from collscore.model import train_pooled
 from collscore.simulate import FAIXA_DIAS_MEDIO, simulate_portfolio
@@ -302,6 +308,23 @@ for canal, default in SALDO_MINIMO_ELEGIVEL.items():
         f"Piso {canal} (R$)", min_value=0.0, value=float(default), step=100.0, format="%.3f", key=f"piso_{canal}"
     )
 
+st.sidebar.subheader("Efetividade por canal")
+st.sidebar.caption(
+    "Proxy de resposta diferencial por canal (caixa incremental x efetividade) -- "
+    "passo intermediario, ate uma modelagem causal de uplift por canal."
+)
+efetividade_canal = {}
+for canal, default in EFETIVIDADE_CANAL.items():
+    efetividade_canal[canal] = st.sidebar.number_input(
+        f"Efetividade {canal}",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(default),
+        step=0.05,
+        format="%.3f",
+        key=f"efetividade_{canal}",
+    )
+
 # --------------------------------------------------------------------------- corpo principal
 
 st.title("collscore -- collection scoring e regularizacao financeira")
@@ -386,6 +409,11 @@ with tab3:
 # ---------------------------------------------------------------- tab 4: estrategia financeira
 with tab4:
     st.subheader("Curva de lucro e corte otimo por faixa/canal")
+    st.caption(
+        "Negativacao modela a inclusao em bureau de credito (Serasa/SPC). Por lei "
+        "(CDC, art. 43) e exigida notificacao previa ao devedor antes da inclusao -- "
+        "o custo default do canal ja embute essa notificacao."
+    )
 
     curva_lucro, resumo_otimo = run_finance_analysis(
         test,
@@ -394,6 +422,7 @@ with tab4:
         canal_custos=canal_custos,
         canal_por_faixa=canal_por_faixa,
         saldo_minimo_elegivel=saldo_minimo_elegivel,
+        efetividade_canal=efetividade_canal,
     )
 
     if curva_lucro.empty:
