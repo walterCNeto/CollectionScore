@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scikit-learn
+matplotlib
+
+# dependencias necessarias para funcionalidades ja existentes no repo:
+pyarrow    # leitura de upload .parquet no app Streamlit
+tabulate   # DataFrame.to_markdown() usado em run_demo.py
