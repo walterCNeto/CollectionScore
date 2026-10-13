@@ -13,23 +13,25 @@ da populacao acionavel da faixa.
 
 "Caixa incremental" e o caixa recuperado (parcela paga) acima de uma taxa de
 regularizacao baseline que ocorreria sem qualquer acionamento (self-cure),
-multiplicado pela efetividade do canal (`EFETIVIDADE_CANAL`). Essa
-efetividade e uma PROXY simplificada de resposta diferencial por canal (nem
-todo contrato acionado por sms responde como um contrato acionado pelo
-juridico) -- e um passo intermediario, ate que o framework tenha dados
-suficientes para uma modelagem causal de uplift por canal (ver o flag
-`flag_self_cure_evento` de `simulate.py`, reservado para esse fim).
-
-Por padrao a baseline de self-cure e estimada como uma fracao
-(`baseline_self_cure_pct`) da taxa de regularizacao observada, aplicada
-apenas as faixas iniciais de atraso (<=30 dias).
+multiplicado pela efetividade da CELULA canal x faixa (`EFETIVIDADE`). Essa
+efetividade e uma PROXY simplificada de resposta diferencial -- um sms tem
+efeito diferente sobre uma faixa inicial de atraso do que sobre uma faixa
+profunda, e o mesmo vale para os demais canais -- e um passo intermediario,
+ate que o framework tenha dados suficientes para uma modelagem causal de
+uplift por canal (ver o flag `flag_self_cure_evento` de `simulate.py`,
+reservado para esse fim). Uma efetividade 0.0 (ex.: juridico nas faixas
+iniciais) torna o canal inelegivel NA PRATICA para aquela faixa, alem de
+qualquer piso de saldo.
 
 Alem do mapeamento fixo faixa->canal (`CANAL_POR_FAIXA`, modo "manual"),
 este modulo oferece uma escolha ENDOGENA de canal: `compare_channels`
 testa, para uma faixa, todos os canais elegiveis (independente do
 mapeamento fixo) e `optimal_strategy` escolhe por faixa o canal vencedor
 segundo um criterio (lucro ou ROI no corte otimo), compondo a estrategia
-completa e seus totais.
+completa e seus totais. As duas estrategias (lucro e ROI) sao dois pontos
+extremos de uma fronteira orcamento x lucro: a de ROI gasta pouco e maximiza
+retorno por R$ investido, a de lucro gasta mais para maximizar o retorno
+absoluto.
 """
 from __future__ import annotations
 
@@ -50,10 +52,27 @@ CANAL_POR_FAIXA = {
 
 SALDO_MINIMO_ELEGIVEL = {"sms": 0.0, "negativacao": 0.0, "call_center": 0.0, "juridico": 5000.00}
 
-EFETIVIDADE_CANAL = {"sms": 0.40, "negativacao": 0.65, "call_center": 1.00, "juridico": 1.00}
+# Efetividade = proxy de resposta diferencial, por celula canal x faixa.
+# juridico com efetividade 0.0 nas faixas iniciais (1-15, 16-30, 31-60) =
+# inelegivel na pratica para essas faixas, alem do piso de saldo.
+EFETIVIDADE = {
+    "sms": {"1-15": 0.50, "16-30": 0.45, "31-60": 0.30, "61-90": 0.20, "91-180": 0.10, "180+": 0.05},
+    "negativacao": {"1-15": 0.40, "16-30": 0.55, "31-60": 0.65, "61-90": 0.60, "91-180": 0.45, "180+": 0.25},
+    "call_center": {"1-15": 0.60, "16-30": 0.65, "31-60": 0.70, "61-90": 0.65, "91-180": 0.50, "180+": 0.30},
+    "juridico": {"1-15": 0.0, "16-30": 0.0, "31-60": 0.0, "61-90": 0.70, "91-180": 0.90, "180+": 0.85},
+}
 
 FAIXAS_SELF_CURE = ("1-15", "16-30")
 BASELINE_SELF_CURE_PCT = 0.30
+
+
+def _lookup_efetividade(efetividade: dict, canal: str | None, faixa: str) -> float:
+    """Efetividade da celula (canal, faixa); 0.0 se o canal nao foi acionado
+    ou se a combinacao nao estiver definida na matriz.
+    """
+    if not canal:
+        return 0.0
+    return efetividade.get(canal, {}).get(faixa, 0.0)
 
 
 def profit_curve(
@@ -67,7 +86,7 @@ def profit_curve(
     canal_custos: dict | None = None,
     canal_por_faixa: dict | None = None,
     saldo_minimo_elegivel: dict | None = None,
-    efetividade_canal: dict | None = None,
+    efetividade: dict | None = None,
     baseline_self_cure_pct: float = BASELINE_SELF_CURE_PCT,
     faixas_self_cure: tuple = FAIXAS_SELF_CURE,
     n_deciles: int = 10,
@@ -76,7 +95,8 @@ def profit_curve(
     `k` decis de score (k = 1..n_deciles, do mais ao menos propenso ao
     evento) dentro da populacao elegivel ao canal daquela faixa (acima do
     piso de saldo em atraso). O caixa incremental e multiplicado pela
-    efetividade do canal (ver `EFETIVIDADE_CANAL` no docstring do modulo).
+    efetividade da celula canal x faixa (ver `EFETIVIDADE` no docstring do
+    modulo).
 
     Retorna uma linha por numero de decis acionados, com custo, caixa
     incremental, lucro e ROI acumulados.
@@ -84,7 +104,7 @@ def profit_curve(
     canal_custos = canal_custos or CANAL_CUSTOS
     canal_por_faixa = canal_por_faixa or CANAL_POR_FAIXA
     saldo_minimo_elegivel = saldo_minimo_elegivel or SALDO_MINIMO_ELEGIVEL
-    efetividade_canal = efetividade_canal or EFETIVIDADE_CANAL
+    efetividade = efetividade or EFETIVIDADE
 
     cols = [score_col, target_col, saldo_col]
     if valor_recuperado_col and valor_recuperado_col in df.columns:
@@ -96,7 +116,7 @@ def profit_curve(
     canal = canal_por_faixa.get(faixa)
     custo_unitario = canal_custos.get(canal, 0.0) if canal else 0.0
     piso = saldo_minimo_elegivel.get(canal, 0.0) if canal else 0.0
-    efetividade = efetividade_canal.get(canal, 1.0) if canal else 1.0
+    efetividade_celula = _lookup_efetividade(efetividade, canal, faixa)
 
     sub = sub.loc[sub[saldo_col] >= piso]
     if sub.empty:
@@ -123,7 +143,7 @@ def profit_curve(
         custo_total = n_contratos * custo_unitario
 
         caixa_bruto = acionados["valor_recuperado"].sum()
-        caixa_incremental = caixa_bruto * fator_incremental * efetividade
+        caixa_incremental = caixa_bruto * fator_incremental * efetividade_celula
 
         lucro = caixa_incremental - custo_total
         roi = caixa_incremental / custo_total if custo_total > 0 else np.nan
@@ -133,7 +153,7 @@ def profit_curve(
                 "faixa_atraso": faixa,
                 "canal": canal,
                 "saldo_minimo_elegivel": piso,
-                "efetividade_canal": efetividade,
+                "efetividade": efetividade_celula,
                 "decis_acionados": k,
                 "n_contratos": n_contratos,
                 "custo_total": round(custo_total, 2),
@@ -156,7 +176,7 @@ def optimal_cutoff(curve: pd.DataFrame) -> dict:
         "faixa_atraso": melhor["faixa_atraso"],
         "canal": melhor["canal"],
         "saldo_minimo_elegivel": melhor["saldo_minimo_elegivel"],
-        "efetividade_canal": melhor["efetividade_canal"],
+        "efetividade": melhor["efetividade"],
         "decis_acionados_otimo": int(melhor["decis_acionados"]),
         "n_contratos_otimo": int(melhor["n_contratos"]),
         "custo_total": float(melhor["custo_total"]),
@@ -214,20 +234,21 @@ def compare_channels(
     valor_recuperado_col: str | None = "valor_recuperado",
     faixa_col: str = "faixa_atraso",
     canal_custos: dict | None = None,
-    efetividade_canal: dict | None = None,
+    efetividade: dict | None = None,
     saldo_minimo_elegivel: dict | None = None,
     n_deciles: int = 10,
 ) -> pd.DataFrame:
     """Compara, para UMA faixa de atraso, o resultado de aciona-la por CADA
     canal elegivel (todos os canais definidos em `canal_custos`),
     independente do mapeamento fixo `CANAL_POR_FAIXA`. Para cada canal, roda
-    `profit_curve` e extrai o corte que maximiza o lucro (`optimal_cutoff`).
+    `profit_curve` (usando a efetividade da celula canal x faixa) e extrai
+    o corte que maximiza o lucro (`optimal_cutoff`).
 
     Retorna uma linha por canal com: faixa_atraso, canal, decis_otimo,
     n_contratos, custo, lucro_max, roi_no_corte.
     """
     canal_custos = canal_custos or CANAL_CUSTOS
-    efetividade_canal = efetividade_canal or EFETIVIDADE_CANAL
+    efetividade = efetividade or EFETIVIDADE
     saldo_minimo_elegivel = saldo_minimo_elegivel or SALDO_MINIMO_ELEGIVEL
 
     linhas = []
@@ -243,7 +264,7 @@ def compare_channels(
             canal_custos=canal_custos,
             canal_por_faixa={faixa: canal},
             saldo_minimo_elegivel=saldo_minimo_elegivel,
-            efetividade_canal=efetividade_canal,
+            efetividade=efetividade,
             n_deciles=n_deciles,
         )
         if curva.empty:
@@ -307,6 +328,11 @@ def optimal_strategy(
     ("lucro" maximiza `lucro_max`, "roi" maximiza `roi_no_corte`) dentre
     todos os canais comparados por `run_channel_comparison`.
 
+    As estrategias "lucro" e "roi" sao dois pontos extremos de uma
+    fronteira orcamento x lucro: "roi" tende a gastar pouco e maximizar o
+    retorno por R$ investido, "lucro" gasta mais para maximizar o retorno
+    absoluto.
+
     Retorna um dict com `estrategia` (DataFrame faixa -> canal escolhido,
     corte, custo, lucro, ROI), `criterio`, `lucro_total`, `custo_total` e
     `roi_agregado` (caixa incremental total / custo total da estrategia).
@@ -358,3 +384,22 @@ def optimal_strategy(
         "custo_total": round(custo_total, 3),
         "roi_agregado": round(roi_agregado, 3) if not np.isnan(roi_agregado) else float("nan"),
     }
+
+
+def fronteira_orcamento_lucro(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """As estrategias "lucro" e "roi" como dois pontos da fronteira
+    orcamento x lucro: para cada criterio, (custo_total, lucro_total,
+    roi_agregado). Util para visualizar o trade-off lado a lado.
+    """
+    linhas = []
+    for criterio in ("roi", "lucro"):
+        resultado = optimal_strategy(df, criterio=criterio, **kwargs)
+        linhas.append(
+            {
+                "criterio": criterio,
+                "custo_total": resultado["custo_total"],
+                "lucro_total": resultado["lucro_total"],
+                "roi_agregado": resultado["roi_agregado"],
+            }
+        )
+    return pd.DataFrame(linhas)

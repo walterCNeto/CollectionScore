@@ -18,8 +18,9 @@ from collscore.features import FEATURE_COLS, build_features
 from collscore.finance import (
     CANAL_CUSTOS,
     CANAL_POR_FAIXA,
-    EFETIVIDADE_CANAL,
+    EFETIVIDADE,
     SALDO_MINIMO_ELEGIVEL,
+    fronteira_orcamento_lucro,
     optimal_strategy,
     run_channel_comparison,
     run_finance_analysis,
@@ -333,22 +334,34 @@ for canal, default in SALDO_MINIMO_ELEGIVEL.items():
         f"Piso {canal} (R$)", min_value=0.0, value=float(default), step=100.0, format="%.3f", key=f"piso_{canal}"
     )
 
-st.sidebar.subheader("Efetividade por canal")
+st.sidebar.subheader("Efetividade (canal x faixa)")
 st.sidebar.caption(
-    "Proxy de resposta diferencial por canal (caixa incremental x efetividade) -- "
-    "passo intermediario, ate uma modelagem causal de uplift por canal."
+    "Proxy de resposta diferencial por celula canal x faixa (caixa incremental x "
+    "efetividade) -- valores ARBITRADOS, nao estimados de dados; passo intermediario "
+    "ate uma modelagem causal de uplift. As conclusoes sobre qual canal vence sao "
+    "sensiveis a esses numeros -- edite a matriz para uma analise de sensibilidade."
 )
-efetividade_canal = {}
-for canal, default in EFETIVIDADE_CANAL.items():
-    efetividade_canal[canal] = st.sidebar.number_input(
-        f"Efetividade {canal}",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(default),
-        step=0.05,
-        format="%.3f",
-        key=f"efetividade_{canal}",
-    )
+matriz_efetividade_base = pd.DataFrame(
+    {faixa: [EFETIVIDADE[canal].get(faixa, 0.0) for canal in CANAIS] for faixa in FAIXAS_DELINQUENTES},
+    index=CANAIS,
+)
+matriz_efetividade_editada = st.sidebar.data_editor(
+    matriz_efetividade_base,
+    column_config={
+        faixa: st.column_config.NumberColumn(faixa, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
+        for faixa in FAIXAS_DELINQUENTES
+    },
+    num_rows="fixed",
+    key="matriz_efetividade",
+    width="stretch",
+)
+efetividade = {
+    canal: {
+        faixa: float(np.clip(matriz_efetividade_editada.loc[canal, faixa], 0.0, 1.0))
+        for faixa in FAIXAS_DELINQUENTES
+    }
+    for canal in CANAIS
+}
 
 # --------------------------------------------------------------------------- corpo principal
 
@@ -448,12 +461,12 @@ with tab4:
         "o custo default do canal ja embute essa notificacao."
     )
     st.caption(
-        "As efetividades por canal sao calibracoes arbitradas (nao estimadas de dados) "
-        "e a comparacao abaixo e entre canais PUROS -- reguas reais de cobranca sao "
-        "sequenciais (sms, depois negativacao, depois call_center/juridico). As "
-        "conclusoes de qual canal vence podem se inverter com outras efetividades: "
-        "use a secao 'Efetividade por canal' na sidebar para uma analise de "
-        "sensibilidade."
+        "A matriz de efetividade (canal x faixa) e uma calibracao ARBITRADA (nao "
+        "estimada de dados) e a comparacao abaixo e entre canais PUROS -- reguas reais "
+        "de cobranca sao sequenciais (sms, depois negativacao, depois "
+        "call_center/juridico). As conclusoes de qual canal vence podem se inverter "
+        "com outros valores: use a secao 'Efetividade (canal x faixa)' na sidebar para "
+        "uma analise de sensibilidade."
     )
 
     # ------------------------------------------------- comparacao canal x faixa
@@ -465,7 +478,7 @@ with tab4:
         target_col=TARGET_COL,
         canal_custos=canal_custos,
         saldo_minimo_elegivel=saldo_minimo_elegivel,
-        efetividade_canal=efetividade_canal,
+        efetividade=efetividade,
     )
 
     if comparacao.empty:
@@ -493,6 +506,43 @@ with tab4:
         )
         st.dataframe(comp_display, width="stretch", hide_index=True)
 
+    # --------------------------------------------- fronteira orcamento x lucro
+    st.subheader("Fronteira orcamento x lucro: lucro vs ROI")
+    st.caption(
+        "As estrategias 'lucro' e 'roi' sao dois pontos extremos de uma fronteira "
+        "orcamento x lucro: ROI gasta pouco e maximiza retorno por R$ investido; "
+        "lucro gasta mais para maximizar o retorno absoluto."
+    )
+
+    fronteira = fronteira_orcamento_lucro(
+        test,
+        score_col="score",
+        target_col=TARGET_COL,
+        canal_custos=canal_custos,
+        saldo_minimo_elegivel=saldo_minimo_elegivel,
+        efetividade=efetividade,
+    )
+
+    if fronteira.empty or fronteira["custo_total"].isna().all():
+        st.warning("Sem estrategia disponivel para tracar a fronteira com os parametros atuais.")
+    else:
+        st.dataframe(fmt3(fronteira), width="stretch", hide_index=True)
+
+        fig_front, ax_front = plt.subplots(figsize=(6, 4))
+        ax_front.scatter(fronteira["custo_total"], fronteira["lucro_total"], s=80, zorder=3)
+        for _, row in fronteira.iterrows():
+            ax_front.annotate(
+                row["criterio"],
+                (row["custo_total"], row["lucro_total"]),
+                textcoords="offset points",
+                xytext=(8, 4),
+            )
+        ax_front.plot(fronteira["custo_total"], fronteira["lucro_total"], linestyle="--", color="grey", zorder=1)
+        ax_front.set_xlabel("Custo total (R$)")
+        ax_front.set_ylabel("Lucro total (R$)")
+        ax_front.set_title("Fronteira orcamento x lucro")
+        st.pyplot(fig_front)
+
     # ------------------------------------------------------------- estrategia
     st.subheader("Estrategia escolhida")
 
@@ -507,7 +557,7 @@ with tab4:
             target_col=TARGET_COL,
             canal_custos=canal_custos,
             saldo_minimo_elegivel=saldo_minimo_elegivel,
-            efetividade_canal=efetividade_canal,
+            efetividade=efetividade,
         )
         estrategia_df = resultado_estrategia["estrategia"]
         canal_por_faixa_efetivo = {"em_dia": None, **dict(zip(estrategia_df["faixa_atraso"], estrategia_df["canal"]))}
@@ -519,7 +569,7 @@ with tab4:
         canal_custos=canal_custos,
         canal_por_faixa=canal_por_faixa_efetivo,
         saldo_minimo_elegivel=saldo_minimo_elegivel,
-        efetividade_canal=efetividade_canal,
+        efetividade=efetividade,
     )
 
     if resumo_otimo.empty:

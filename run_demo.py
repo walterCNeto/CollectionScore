@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from collscore.features import FEATURE_COLS, build_features
-from collscore.finance import optimal_strategy, run_channel_comparison, run_finance_analysis
+from collscore.finance import fronteira_orcamento_lucro, optimal_strategy, run_channel_comparison, run_finance_analysis
 from collscore.metrics import (
     decile_table,
     ks_gini_por_faixa,
@@ -112,23 +112,7 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     comparacao_canais = run_channel_comparison(test, score_col="score", target_col=TARGET_COL)
     estrategia_lucro = optimal_strategy(test, criterio="lucro", score_col="score", target_col=TARGET_COL)
     estrategia_roi = optimal_strategy(test, criterio="roi", score_col="score", target_col=TARGET_COL)
-
-    totais_lado_a_lado = pd.DataFrame(
-        [
-            {
-                "criterio": "lucro",
-                "lucro_total": estrategia_lucro["lucro_total"],
-                "custo_total": estrategia_lucro["custo_total"],
-                "roi_agregado": estrategia_lucro["roi_agregado"],
-            },
-            {
-                "criterio": "roi",
-                "lucro_total": estrategia_roi["lucro_total"],
-                "custo_total": estrategia_roi["custo_total"],
-                "roi_agregado": estrategia_roi["roi_agregado"],
-            },
-        ]
-    )
+    fronteira = fronteira_orcamento_lucro(test, score_col="score", target_col=TARGET_COL)
 
     # --------------------------------------------------------------- relatorio
     w("# Relatorio collscore")
@@ -200,9 +184,13 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     )
     w()
     w(md_table(comparacao_canais))
-    w("Totais das duas estrategias endogenas, lado a lado:")
+    w(
+        "As estrategias 'lucro' e 'roi' sao dois pontos extremos de uma fronteira "
+        "orcamento x lucro: ROI gasta pouco e maximiza retorno por R$ investido; "
+        "lucro gasta mais para maximizar o retorno absoluto. Totais lado a lado:"
+    )
     w()
-    w(md_table(totais_lado_a_lado))
+    w(md_table(fronteira))
     w("Estrategia otima por lucro (canal vencedor por faixa):")
     w()
     w(md_table(estrategia_lucro["estrategia"]))
