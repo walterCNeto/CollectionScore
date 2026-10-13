@@ -1,5 +1,10 @@
-"""Pipeline ponta a ponta do collscore: simula -> features -> targets ->
-treina (por faixa e pooled) -> metricas -> financas -> relatorio.md.
+"""Pipeline ponta a ponta do collscore: simula -> features -> target
+(pagou_1parcela) -> treina modelo pooled -> metricas de regularizacao
+financeira -> financas -> relatorio.md.
+
+Aplica burn-in: descarta os snapshots 0-5 (carteira ainda estabilizando a
+distribuicao de faixas apos a reposicao mensal) e treina/mede apenas nos
+snapshots 6-11.
 
 Uso: python run_demo.py [--n-contratos 50000] [--seed 42] [--output relatorio.md]
 """
@@ -11,20 +16,15 @@ import io
 import numpy as np
 import pandas as pd
 
-from collscore import FAIXAS
 from collscore.features import FEATURE_COLS, build_features
 from collscore.finance import run_finance_analysis
-from collscore.metrics import (
-    decile_table,
-    decile_table_cash,
-    metrics_by_faixa,
-    psi_between_snapshots,
-)
-from collscore.model import train_per_faixa, train_pooled
+from collscore.metrics import decile_table, model_ks_gini, resumo_regularizacao, roll_rate_saldo
+from collscore.model import train_pooled
 from collscore.simulate import simulate_portfolio
-from collscore.target import TARGET_COLS, compute_targets
+from collscore.target import compute_targets
 
-PRIMARY_TARGET = "cura_total"
+TARGET_COL = "pagou_1parcela"
+BURN_IN_SNAPSHOT = 6
 
 
 def md_table(df: pd.DataFrame) -> str:
@@ -43,15 +43,6 @@ def train_test_split_book(book: pd.DataFrame, test_frac: float = 0.3, seed: int 
     return book.loc[~is_test].copy(), book.loc[is_test].copy()
 
 
-def score_per_faixa(modelos: dict, df: pd.DataFrame, faixa_col: str = "faixa_atraso") -> np.ndarray:
-    score = np.full(len(df), np.nan)
-    for faixa, fm in modelos.items():
-        mask = (df[faixa_col] == faixa).to_numpy()
-        if mask.any():
-            score[mask] = fm.predict_proba(df.loc[mask])
-    return score
-
-
 def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, output: str = "relatorio.md"):
     buf = io.StringIO()
 
@@ -60,132 +51,97 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
 
     print("Simulando carteira...")
     panel = simulate_portfolio(n_contratos=n_contratos, n_snapshots=n_snapshots, seed=seed)
+    panel_pos_burnin = panel[panel["snapshot"] >= BURN_IN_SNAPSHOT].copy()
 
     print("Construindo features...")
     feats = build_features(panel)
 
-    print("Calculando targets...")
+    print("Calculando target pagou_1parcela...")
     targets = compute_targets(panel)
 
-    book_full = feats.merge(targets, on=["contrato_id", "snapshot"])
+    book_full = feats.merge(targets[["contrato_id", "snapshot", TARGET_COL]], on=["contrato_id", "snapshot"])
+    book_full = book_full[book_full["snapshot"] >= BURN_IN_SNAPSHOT]
     book = book_full[book_full["faixa_atraso"] != "em_dia"].copy()
+    book_elegivel = book.dropna(subset=[TARGET_COL]).copy()
+    book_elegivel["valor_recuperado"] = book_elegivel[TARGET_COL] * book_elegivel["parcela_valor"]
 
-    train, test = train_test_split_book(book, test_frac=0.3, seed=seed)
+    train, test = train_test_split_book(book_elegivel, test_frac=0.3, seed=seed)
 
     # --------------------------------------------------------------- treino
-    print("Treinando modelos (por faixa e pooled) para os 3 targets...")
-    resultados_targets = {}
-    for target_col in TARGET_COLS:
-        train_t = train.dropna(subset=[target_col])
-        test_t = test.dropna(subset=[target_col])
+    print("Treinando modelo pooled (target pagou_1parcela)...")
+    modelo = train_pooled(train, FEATURE_COLS, TARGET_COL)
 
-        modelos_faixa = train_per_faixa(train_t, FEATURE_COLS, target_col)
-        modelo_pooled = train_pooled(train_t, FEATURE_COLS, target_col)
+    test = test.copy()
+    test["score"] = modelo.predict_proba(test)
 
-        test_t = test_t.copy()
-        test_t["score_pooled"] = modelo_pooled.predict_proba(test_t)
-        test_t["score_faixa"] = score_per_faixa(modelos_faixa, test_t)
-
-        met_pooled = metrics_by_faixa(test_t, "score_pooled", target_col).add_suffix("_pooled")
-        met_faixa = metrics_by_faixa(
-            test_t.dropna(subset=["score_faixa"]), "score_faixa", target_col
-        ).add_suffix("_faixa")
-
-        comparacao = met_pooled.merge(
-            met_faixa, left_on="faixa_atraso_pooled", right_on="faixa_atraso_faixa", how="outer"
-        )
-        comparacao["faixa_atraso"] = comparacao["faixa_atraso_pooled"].fillna(comparacao["faixa_atraso_faixa"])
-        comparacao = comparacao[
-            ["faixa_atraso", "n_pooled", "auc_pooled", "auc_faixa", "ks_pooled", "ks_faixa", "gini_pooled", "gini_faixa"]
-        ]
-
-        resultados_targets[target_col] = dict(
-            modelos_faixa=modelos_faixa,
-            modelo_pooled=modelo_pooled,
-            test_t=test_t,
-            comparacao=comparacao,
-        )
-
-    # ----------------------------------------------------- financas (cura_total)
-    print("Rodando analise financeira...")
-    primary = resultados_targets[PRIMARY_TARGET]
-    test_primary = primary["test_t"].copy()
-    test_primary["score"] = test_primary["score_faixa"].fillna(test_primary["score_pooled"])
+    # -------------------------------------------------------- metricas/financas
+    print("Calculando metricas de regularizacao e curva de lucro...")
+    resumo_exec = resumo_regularizacao(book_elegivel, target_col=TARGET_COL)
+    rr_saldo = roll_rate_saldo(panel_pos_burnin)
 
     dec_contrato = decile_table(
-        test_primary["score"].to_numpy(),
-        test_primary[PRIMARY_TARGET].to_numpy(),
-        test_primary["saldo_atraso"].to_numpy(),
-    )
-    dec_caixa = decile_table_cash(
-        test_primary["score"].to_numpy(),
-        test_primary[PRIMARY_TARGET].to_numpy(),
-        test_primary["saldo_atraso"].to_numpy(),
+        test["score"].to_numpy(),
+        test[TARGET_COL].to_numpy(),
+        test["saldo_atraso"].to_numpy(),
+        test["valor_recuperado"].to_numpy(),
     )
 
-    curva_lucro, resumo_otimo = run_finance_analysis(test_primary, score_col="score", target_col=PRIMARY_TARGET)
+    curva_lucro, resumo_otimo = run_finance_analysis(test, score_col="score", target_col=TARGET_COL)
 
-    # score pooled aplicado ao book completo (todas as fotos) para PSI
-    scored_full = book.dropna(subset=[PRIMARY_TARGET]).copy()
-    scored_full["score_pooled"] = primary["modelo_pooled"].predict_proba(scored_full)
-    psi_df = psi_between_snapshots(scored_full, "score_pooled")
+    ks_gini = model_ks_gini(test["score"].to_numpy(), test[TARGET_COL].to_numpy())
+
+    # tabela executiva: saldo em atraso | taxa_reg_contratos | taxa_reg_caixa | custo acionamento | ROI
+    exec_fin = resumo_exec.merge(
+        resumo_otimo[["faixa_atraso", "canal", "custo_total", "roi_no_corte"]],
+        on="faixa_atraso",
+        how="left",
+    )
+    exec_fin = exec_fin[
+        ["faixa_atraso", "saldo_atraso_total", "taxa_reg_contratos", "taxa_reg_caixa", "canal", "custo_total", "roi_no_corte"]
+    ].rename(columns={"custo_total": "custo_acionamento", "roi_no_corte": "roi"})
 
     # --------------------------------------------------------------- relatorio
     w("# Relatorio collscore")
     w()
-    w(f"Carteira simulada: `n_contratos={n_contratos}`, `n_snapshots={n_snapshots}`, `seed={seed}`.")
-    w()
-
-    w("## 1. Resumo da simulacao")
-    w()
-    panel_tmp = panel.assign(delinquente=(panel["faixa_atraso"] != "em_dia").astype(float))
-    resumo_sim = (
-        panel_tmp.groupby("snapshot")
-        .agg(
-            n_contratos=("contrato_id", "size"),
-            pct_delinquente=("delinquente", "mean"),
-            saldo_devedor_total=("saldo_devedor", "sum"),
-            saldo_atraso_total=("saldo_atraso", "sum"),
-        )
-        .round(3)
-        .reset_index()
+    w(
+        f"Carteira simulada: `n_contratos={n_contratos}`, `n_snapshots={n_snapshots}`, `seed={seed}`. "
+        f"Burn-in: snapshots 0-{BURN_IN_SNAPSHOT - 1} descartados; treino e avaliacao em snapshots "
+        f"{BURN_IN_SNAPSHOT}-{n_snapshots - 1}. Target: `{TARGET_COL}`."
     )
-    w(md_table(resumo_sim))
-
-    w("## 2. Targets de collection scoring (book delinquente, janela M->M+1)")
     w()
-    w("Media dos 3 targets no book completo (todas as fotos, contratos delinquentes em M):")
-    w()
-    medias_targets = book[TARGET_COLS].mean().round(3).rename("media").reset_index().rename(columns={"index": "target"})
-    w(md_table(medias_targets))
 
-    w("## 3. Comparacao por faixa vs pooled (AUC / KS / Gini no conjunto de teste)")
+    w("## (a) Tabela executiva por faixa")
     w()
-    for target_col in TARGET_COLS:
-        w(f"### Target: `{target_col}`")
-        w()
-        w(md_table(resultados_targets[target_col]["comparacao"]))
+    w(
+        "Saldo em atraso, taxa de regularizacao (contratos e caixa), canal, "
+        "custo de acionamento e ROI no corte otimo (linha TOTAL sem canal/custo/ROI, "
+        "pois a estrategia e definida por faixa)."
+    )
+    w()
+    w(md_table(exec_fin))
 
-    w(f"## 4. Tabela de decis por contrato (target `{PRIMARY_TARGET}`, score={{faixa com fallback pooled}})")
+    w("## (b) Roll rate de saldo M -> M+1")
+    w()
+    w("Fracao do saldo devedor (R$) na faixa de origem (linha) que migra para cada faixa de destino (coluna) no mes seguinte.")
+    w()
+    w(md_table(rr_saldo.reset_index()))
+
+    w(f"## (c) Decis de score com caixa recuperado (conjunto de teste, target `{TARGET_COL}`)")
     w()
     w(md_table(dec_contrato))
 
-    w(f"## 5. Tabela de decis por caixa / volume financeiro (target `{PRIMARY_TARGET}`)")
+    w("## (d) Curva de lucro e corte otimo por canal (com piso de saldo elegivel)")
     w()
-    w(md_table(dec_caixa))
-
-    w("## 6. PSI do score pooled entre fotos mensais (vs. snapshot base)")
-    w()
-    w(md_table(psi_df))
-
-    w("## 7. Curva de lucro e corte otimo por faixa")
-    w()
-    w("Curva completa (lucro acumulado por numero de decis acionados, canal por faixa):")
+    w("Curva completa (lucro acumulado por numero de decis acionados):")
     w()
     w(md_table(curva_lucro))
-    w("Corte otimo por faixa (maximiza lucro):")
+    w("Corte otimo por faixa/canal (maximiza lucro):")
     w()
     w(md_table(resumo_otimo))
+
+    w("## (e) KS / Gini globais do modelo (conjunto de teste)")
+    w()
+    w(md_table(ks_gini))
 
     with open(output, "w", encoding="utf-8") as f:
         f.write(buf.getvalue())

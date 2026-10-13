@@ -58,6 +58,7 @@ def build_features(panel: pd.DataFrame) -> pd.DataFrame:
             "faixa_atraso": df["faixa_atraso"],
             "saldo_devedor": df["saldo_devedor"],
             "saldo_atraso": df["saldo_atraso"],
+            "parcela_valor": df["parcela_valor"],
             "pct_saldo_atraso": pct_saldo_atraso,
             "pct_parcelas_pagas": pct_parcelas_pagas,
             "dias_atraso": df["dias_atraso"],

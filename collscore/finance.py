@@ -1,16 +1,21 @@
 """Avaliacao financeira da estrategia de cobranca.
 
-Dado um book escorado (score de cura por contrato), simula o resultado de
-acionar os top decis de cada faixa de atraso atraves de um canal de custo
-crescente (sms -> humano -> juridico), e deriva a curva de lucro
-L(corte) = caixa incremental - custo de acionamento, o corte otimo por faixa
-e o ROI da estrategia.
+Dado um book escorado (score de `pagou_1parcela` por contrato), simula o
+resultado de acionar os top decis de cada faixa de atraso atraves de um
+canal de custo crescente (sms -> humano -> juridico), e deriva a curva de
+lucro L(corte) = caixa incremental - custo de acionamento, o corte otimo por
+faixa/canal e o ROI da estrategia.
 
-"Caixa incremental" e o caixa recuperado acima de uma taxa de cura baseline
-que ocorreria sem qualquer acionamento (self-cure). Por padrao essa baseline
-e estimada como uma fracao (`baseline_self_cure_pct`) da taxa de cura
-observada, aplicada apenas as faixas iniciais de atraso (<=30 dias) -- em
-linha com o componente de self-cure gerado em `simulate.py`.
+Cada canal tem um `saldo_minimo_elegivel`: contratos com saldo em atraso
+abaixo desse piso nao sao acionaveis por aquele canal (ex.: nao vale a pena
+acionar o juridico, custo fixo alto, para um saldo pequeno) e sao excluidos
+da populacao acionavel da faixa.
+
+"Caixa incremental" e o caixa recuperado (parcela paga) acima de uma taxa de
+regularizacao baseline que ocorreria sem qualquer acionamento (self-cure).
+Por padrao essa baseline e estimada como uma fracao
+(`baseline_self_cure_pct`) da taxa de regularizacao observada, aplicada
+apenas as faixas iniciais de atraso (<=30 dias).
 """
 from __future__ import annotations
 
@@ -29,15 +34,7 @@ CANAL_POR_FAIXA = {
     "180+": "juridico",
 }
 
-HAIRCUT_FAIXA = {
-    "em_dia": 1.00,
-    "1-15": 0.95,
-    "16-30": 0.90,
-    "31-60": 0.80,
-    "61-90": 0.65,
-    "91-180": 0.50,
-    "180+": 0.35,
-}
+SALDO_MINIMO_ELEGIVEL = {"sms": 0.0, "humano": 0.0, "juridico": 5000.00}
 
 FAIXAS_SELF_CURE = ("1-15", "16-30")
 BASELINE_SELF_CURE_PCT = 0.30
@@ -47,50 +44,65 @@ def profit_curve(
     df: pd.DataFrame,
     faixa: str,
     score_col: str = "score",
-    target_col: str = "cura_total",
+    target_col: str = "pagou_1parcela",
     saldo_col: str = "saldo_atraso",
+    valor_recuperado_col: str | None = "valor_recuperado",
     faixa_col: str = "faixa_atraso",
     canal_custos: dict | None = None,
     canal_por_faixa: dict | None = None,
-    haircut_faixa: dict | None = None,
+    saldo_minimo_elegivel: dict | None = None,
     baseline_self_cure_pct: float = BASELINE_SELF_CURE_PCT,
     faixas_self_cure: tuple = FAIXAS_SELF_CURE,
     n_deciles: int = 10,
 ) -> pd.DataFrame:
     """Curva de lucro L(corte) para uma faixa de atraso, acionando os top
-    `k` decis de score (k = 1..n_deciles, do mais ao menos propenso a cura).
+    `k` decis de score (k = 1..n_deciles, do mais ao menos propenso ao
+    evento) dentro da populacao elegivel ao canal daquela faixa (acima do
+    piso de saldo em atraso).
 
     Retorna uma linha por numero de decis acionados, com custo, caixa
     incremental, lucro e ROI acumulados.
     """
     canal_custos = canal_custos or CANAL_CUSTOS
     canal_por_faixa = canal_por_faixa or CANAL_POR_FAIXA
-    haircut_faixa = haircut_faixa or HAIRCUT_FAIXA
+    saldo_minimo_elegivel = saldo_minimo_elegivel or SALDO_MINIMO_ELEGIVEL
 
-    sub = df.loc[df[faixa_col] == faixa, [score_col, target_col, saldo_col]].dropna()
+    cols = [score_col, target_col, saldo_col]
+    if valor_recuperado_col and valor_recuperado_col in df.columns:
+        cols.append(valor_recuperado_col)
+    sub = df.loc[df[faixa_col] == faixa, cols].dropna(subset=[score_col, target_col, saldo_col])
     if sub.empty:
         return pd.DataFrame()
 
     canal = canal_por_faixa.get(faixa)
     custo_unitario = canal_custos.get(canal, 0.0) if canal else 0.0
-    haircut = haircut_faixa.get(faixa, 1.0)
+    piso = saldo_minimo_elegivel.get(canal, 0.0) if canal else 0.0
 
-    cure_rate_total = sub[target_col].mean()
-    baseline_rate = cure_rate_total * baseline_self_cure_pct if faixa in faixas_self_cure else 0.0
-    incremental_rate_pop = max(cure_rate_total - baseline_rate, 0.0)
-    # fracao da taxa de cura total que e incremental (atribuivel ao acionamento)
-    fator_incremental = incremental_rate_pop / cure_rate_total if cure_rate_total > 0 else 0.0
+    sub = sub.loc[sub[saldo_col] >= piso]
+    if sub.empty:
+        return pd.DataFrame()
+
+    if valor_recuperado_col and valor_recuperado_col in sub.columns:
+        sub = sub.rename(columns={valor_recuperado_col: "valor_recuperado"})
+    else:
+        sub = sub.assign(valor_recuperado=sub[target_col] * sub[saldo_col])
+
+    taxa_reg_total = sub[target_col].mean()
+    baseline_rate = taxa_reg_total * baseline_self_cure_pct if faixa in faixas_self_cure else 0.0
+    incremental_rate_pop = max(taxa_reg_total - baseline_rate, 0.0)
+    fator_incremental = incremental_rate_pop / taxa_reg_total if taxa_reg_total > 0 else 0.0
 
     ranks = sub[score_col].rank(method="first")
-    sub = sub.assign(decil=pd.qcut(ranks, n_deciles, labels=False) + 1)
+    sub = sub.assign(decil=pd.qcut(ranks, min(n_deciles, len(sub)), labels=False, duplicates="drop") + 1)
+    n_deciles_efetivo = sub["decil"].max()
 
     linhas = []
-    for k in range(1, n_deciles + 1):
-        acionados = sub[sub["decil"] > n_deciles - k]
+    for k in range(1, n_deciles_efetivo + 1):
+        acionados = sub[sub["decil"] > n_deciles_efetivo - k]
         n_contratos = len(acionados)
         custo_total = n_contratos * custo_unitario
 
-        caixa_bruto = (acionados[target_col] * acionados[saldo_col] * haircut).sum()
+        caixa_bruto = acionados["valor_recuperado"].sum()
         caixa_incremental = caixa_bruto * fator_incremental
 
         lucro = caixa_incremental - custo_total
@@ -100,6 +112,7 @@ def profit_curve(
             {
                 "faixa_atraso": faixa,
                 "canal": canal,
+                "saldo_minimo_elegivel": piso,
                 "decis_acionados": k,
                 "n_contratos": n_contratos,
                 "custo_total": round(custo_total, 2),
@@ -121,8 +134,10 @@ def optimal_cutoff(curve: pd.DataFrame) -> dict:
     return {
         "faixa_atraso": melhor["faixa_atraso"],
         "canal": melhor["canal"],
+        "saldo_minimo_elegivel": melhor["saldo_minimo_elegivel"],
         "decis_acionados_otimo": int(melhor["decis_acionados"]),
         "n_contratos_otimo": int(melhor["n_contratos"]),
+        "custo_total": float(melhor["custo_total"]),
         "lucro_max": float(melhor["lucro"]),
         "roi_no_corte": float(melhor["roi"]) if not pd.isna(melhor["roi"]) else np.nan,
     }
@@ -131,8 +146,9 @@ def optimal_cutoff(curve: pd.DataFrame) -> dict:
 def run_finance_analysis(
     df: pd.DataFrame,
     score_col: str = "score",
-    target_col: str = "cura_total",
+    target_col: str = "pagou_1parcela",
     saldo_col: str = "saldo_atraso",
+    valor_recuperado_col: str | None = "valor_recuperado",
     faixa_col: str = "faixa_atraso",
     **kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -144,7 +160,14 @@ def run_finance_analysis(
     resumos = []
     for faixa in faixas:
         curva = profit_curve(
-            df, faixa, score_col=score_col, target_col=target_col, saldo_col=saldo_col, faixa_col=faixa_col, **kwargs
+            df,
+            faixa,
+            score_col=score_col,
+            target_col=target_col,
+            saldo_col=saldo_col,
+            valor_recuperado_col=valor_recuperado_col,
+            faixa_col=faixa_col,
+            **kwargs,
         )
         if curva.empty:
             continue
