@@ -18,15 +18,26 @@ import numpy as np
 import pandas as pd
 
 from collscore.features import FEATURE_COLS, build_features
-from collscore.finance import fronteira_orcamento_lucro, optimal_strategy, run_channel_comparison, run_finance_analysis
+from collscore.finance import (
+    CANAL_CUSTOS,
+    CANAL_POR_FAIXA,
+    EFETIVIDADE,
+    SALDO_MINIMO_ELEGIVEL,
+    fronteira_orcamento_lucro,
+    optimal_strategy,
+    run_channel_comparison,
+    run_finance_analysis,
+)
 from collscore.metrics import (
     decile_table,
     ks_gini_por_faixa,
     model_ks_gini,
     resumo_regularizacao,
     roll_rate_saldo,
+    taxas_evento_por_faixa,
 )
 from collscore.model import train_pooled
+from collscore.report import build_html_report
 from collscore.simulate import simulate_portfolio
 from collscore.target import compute_targets
 
@@ -50,7 +61,13 @@ def train_test_split_book(book: pd.DataFrame, test_frac: float = 0.3, seed: int 
     return book.loc[~is_test].copy(), book.loc[is_test].copy()
 
 
-def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, output: str = "relatorio.md"):
+def main(
+    n_contratos: int = 50_000,
+    n_snapshots: int = 12,
+    seed: int = 42,
+    output: str = "relatorio.md",
+    html_output: str = "relatorio_modelo.html",
+):
     buf = io.StringIO()
 
     def w(txt: str = ""):
@@ -66,7 +83,10 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
     print("Calculando target pagou_1parcela...")
     targets = compute_targets(panel)
 
-    book_full = feats.merge(targets[["contrato_id", "snapshot", TARGET_COL]], on=["contrato_id", "snapshot"])
+    book_full = feats.merge(
+        targets[["contrato_id", "snapshot", "pagou_1parcela", "cura_total", "melhora_faixa"]],
+        on=["contrato_id", "snapshot"],
+    )
     book_full = book_full[book_full["snapshot"] >= BURN_IN_SNAPSHOT]
     book = book_full[book_full["faixa_atraso"] != "em_dia"].copy()
     book_elegivel = book.dropna(subset=[TARGET_COL]).copy()
@@ -202,6 +222,49 @@ def main(n_contratos: int = 50_000, n_snapshots: int = 12, seed: int = 42, outpu
         f.write(buf.getvalue())
     print(f"Relatorio escrito em {output}")
 
+    # ------------------------------------------------- relatorio HTML de validacao
+    print("Gerando relatorio HTML de desenvolvimento e validacao...")
+    targets_alternativos = taxas_evento_por_faixa(book, ["pagou_1parcela", "cura_total", "melhora_faixa"])
+    feature_describe = book_elegivel[FEATURE_COLS].describe(percentiles=[0.25, 0.5, 0.75]).T.round(3)
+    volumetria_snapshot = (
+        panel_pos_burnin.assign(delinquente=(panel_pos_burnin["faixa_atraso"] != "em_dia").astype(float))
+        .groupby("snapshot")
+        .agg(n_contratos=("contrato_id", "size"), pct_delinquente=("delinquente", "mean"))
+        .round(3)
+        .reset_index()
+    )
+
+    resultados_html = dict(
+        resumo_exec=resumo_exec,
+        rr_saldo=rr_saldo,
+        ks_gini=ks_gini,
+        ks_gini_faixa=ks_gini_faixa,
+        decile=dec_contrato,
+        test=test,
+        targets_alternativos=targets_alternativos,
+        feature_describe=feature_describe,
+        volumetria_snapshot=volumetria_snapshot,
+        n_train=len(train),
+        n_test=len(test),
+    )
+    parametros_html = dict(
+        fonte="Base de exemplo (simulada)",
+        n_contratos=n_contratos,
+        n_snapshots=n_snapshots,
+        burn_in=BURN_IN_SNAPSHOT,
+        seed=seed,
+        target_col=TARGET_COL,
+        canal_custos=dict(CANAL_CUSTOS),
+        estrategia_modo="Automatica (maximizar lucro)",
+        canal_por_faixa_manual=dict(CANAL_POR_FAIXA),
+        saldo_minimo_elegivel=dict(SALDO_MINIMO_ELEGIVEL),
+        efetividade={canal: dict(faixas) for canal, faixas in EFETIVIDADE.items()},
+    )
+    html = build_html_report(resultados_html, parametros_html)
+    with open(html_output, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Relatorio HTML escrito em {html_output}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -209,5 +272,12 @@ if __name__ == "__main__":
     parser.add_argument("--n-snapshots", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="relatorio.md")
+    parser.add_argument("--html-output", type=str, default="relatorio_modelo.html")
     args = parser.parse_args()
-    main(n_contratos=args.n_contratos, n_snapshots=args.n_snapshots, seed=args.seed, output=args.output)
+    main(
+        n_contratos=args.n_contratos,
+        n_snapshots=args.n_snapshots,
+        seed=args.seed,
+        output=args.output,
+        html_output=args.html_output,
+    )

@@ -1,8 +1,14 @@
 """App Streamlit do framework collscore.
 
 Reutiliza os modulos do pacote `collscore` (simulate, features, target,
-model, metrics, finance) sem duplicar logica de negocio -- este arquivo so
-contem orquestracao, cache, validacao de upload e visualizacao.
+model, metrics, finance, report) sem duplicar logica de negocio -- este
+arquivo so contem orquestracao, cache, validacao de upload e visualizacao.
+
+Nada recalcula automaticamente: os controles ficam dentro de um `st.form` e
+so sao aplicados no clique de "Aplicar e rodar modelo". O resultado (e os
+parametros usados para gera-lo) ficam em `st.session_state`; as abas
+renderizam exclusivamente a partir de la. No primeiro carregamento, o
+pipeline roda uma vez com os defaults para o app nao abrir vazio.
 """
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ from collscore.finance import (
     EFETIVIDADE,
     SALDO_MINIMO_ELEGIVEL,
     fronteira_orcamento_lucro,
-    optimal_strategy,
+    resolve_canal_por_faixa,
     run_channel_comparison,
     run_finance_analysis,
 )
@@ -31,8 +37,10 @@ from collscore.metrics import (
     model_ks_gini,
     resumo_regularizacao,
     roll_rate_saldo,
+    taxas_evento_por_faixa,
 )
 from collscore.model import train_pooled
+from collscore.report import build_html_report
 from collscore.simulate import FAIXA_DIAS_MEDIO, simulate_portfolio
 from collscore.target import compute_targets
 from run_demo import TARGET_COL, train_test_split_book
@@ -50,6 +58,25 @@ REQUIRED_UPLOAD_COLS = [
     "parcelas_pagas",
     "parcelas_vencidas",
 ]
+
+FONTE_SIMULADA = "Base de exemplo (simulada)"
+FONTE_UPLOAD = "Upload de base própria"
+
+DEFAULTS = dict(
+    fonte=FONTE_SIMULADA,
+    n_contratos=15_000,
+    n_snapshots=8,
+    seed=42,
+    arquivo_bytes=None,
+    arquivo_nome=None,
+    canal_custos=dict(CANAL_CUSTOS),
+    estrategia_modo="Automatica (maximizar lucro)",
+    canal_por_faixa_manual={"em_dia": None, **{f: CANAL_POR_FAIXA.get(f, "sms") for f in FAIXAS_DELINQUENTES}},
+    saldo_minimo_elegivel=dict(SALDO_MINIMO_ELEGIVEL),
+    efetividade={canal: dict(faixas) for canal, faixas in EFETIVIDADE.items()},
+    target_col=TARGET_COL,
+)
+DEFAULTS["burn_in"] = DEFAULTS["n_snapshots"] // 2
 
 st.set_page_config(page_title="collscore", layout="wide")
 
@@ -176,7 +203,10 @@ def _montar_pipeline(panel: pd.DataFrame, burn_in: int, seed: int) -> dict:
     feats = build_features(panel)
     targets = compute_targets(panel)
 
-    book_full = feats.merge(targets[["contrato_id", "snapshot", TARGET_COL]], on=["contrato_id", "snapshot"])
+    book_full = feats.merge(
+        targets[["contrato_id", "snapshot", "pagou_1parcela", "cura_total", "melhora_faixa"]],
+        on=["contrato_id", "snapshot"],
+    )
     book_full = book_full[book_full["snapshot"] >= burn_in]
     book = book_full[book_full["faixa_atraso"] != "em_dia"].copy()
     book_elegivel = book.dropna(subset=[TARGET_COL]).copy()
@@ -216,6 +246,16 @@ def _montar_pipeline(panel: pd.DataFrame, burn_in: int, seed: int) -> dict:
         test["saldo_atraso"].to_numpy(),
         test["valor_recuperado"].to_numpy(),
     )
+    targets_alternativos = taxas_evento_por_faixa(book, ["pagou_1parcela", "cura_total", "melhora_faixa"])
+    feature_describe = book_elegivel[FEATURE_COLS].describe(percentiles=[0.25, 0.5, 0.75]).T.round(3)
+
+    volumetria_snapshot = (
+        panel_pos_burnin.assign(delinquente=(panel_pos_burnin["faixa_atraso"] != "em_dia").astype(float))
+        .groupby("snapshot")
+        .agg(n_contratos=("contrato_id", "size"), pct_delinquente=("delinquente", "mean"))
+        .round(3)
+        .reset_index()
+    )
 
     return dict(
         resumo_exec=resumo_exec,
@@ -224,6 +264,9 @@ def _montar_pipeline(panel: pd.DataFrame, burn_in: int, seed: int) -> dict:
         ks_gini_faixa=ks_gini_faixa,
         decile=dec,
         test=test,
+        targets_alternativos=targets_alternativos,
+        feature_describe=feature_describe,
+        volumetria_snapshot=volumetria_snapshot,
         n_train=len(train),
         n_test=len(test),
     )
@@ -254,135 +297,192 @@ def fmt3(df: pd.DataFrame) -> pd.DataFrame:
     return df.round(3)
 
 
-# --------------------------------------------------------------------------- sidebar: fonte de dados
+def normalizar_estrategia_modo(estrategia_modo: str) -> str:
+    if estrategia_modo.startswith("Manual"):
+        return "manual"
+    return "lucro" if "lucro" in estrategia_modo else "roi"
 
-st.sidebar.header("Fonte de dados")
-fonte = st.sidebar.radio("Fonte", ["Base de exemplo (simulada)", "Upload de base própria"])
 
-pipeline = None
-erro_pipeline = None
-
-if fonte == "Base de exemplo (simulada)":
-    n_contratos = st.sidebar.slider("n_contratos", 5000, 50_000, 15_000, step=1000)
-    n_snapshots = st.sidebar.slider("n_snapshots", 6, 12, 8)
-    burn_in = n_snapshots // 2
-    st.sidebar.caption(
-        f"Burn-in proporcional: descarta snapshots 0-{burn_in - 1}; "
-        f"treina e mede em {burn_in}-{n_snapshots - 1}."
-    )
+def executar_pipeline(params: dict) -> None:
+    """Roda o pipeline (simulado ou upload) com os parametros dados e guarda
+    resultados + parametros + erro em `st.session_state`. Chamado no
+    primeiro carregamento (com `DEFAULTS`) e a cada submit do formulario.
+    """
     try:
-        pipeline = pipeline_simulado(n_contratos, n_snapshots, seed=42, burn_in=burn_in)
+        if params["fonte"] == FONTE_SIMULADA:
+            resultados = pipeline_simulado(
+                params["n_contratos"], params["n_snapshots"], params["seed"], params["burn_in"]
+            )
+        else:
+            if params.get("arquivo_bytes") is None:
+                raise ValueError("Selecione um arquivo (CSV ou Parquet) antes de aplicar.")
+            resultados = pipeline_upload(params["arquivo_bytes"], params["arquivo_nome"], params["seed"])
     except ValueError as e:
-        erro_pipeline = str(e)
+        msg = str(e)
+        if msg.startswith("ERROS_VALIDACAO::"):
+            st.session_state["erro"] = msg.split("::", 1)[1].split("||")
+        else:
+            st.session_state["erro"] = [msg]
+        # mantem os ultimos resultados bons (se houver) visiveis junto do erro,
+        # em vez de esvaziar o dashboard por causa de um submit invalido
+        return
 
-else:
-    st.sidebar.download_button(
-        "Baixar template CSV",
-        data=gerar_template_csv(),
-        file_name="template_collscore.csv",
-        mime="text/csv",
-    )
-    arquivo = st.sidebar.file_uploader("Painel (CSV ou Parquet)", type=["csv", "parquet"])
-    if arquivo is not None:
-        try:
-            pipeline = pipeline_upload(arquivo.getvalue(), arquivo.name, seed=42)
-        except ValueError as e:
-            msg = str(e)
-            if msg.startswith("ERROS_VALIDACAO::"):
-                erro_pipeline = msg.split("::", 1)[1].split("||")
-            else:
-                erro_pipeline = [msg]
+    st.session_state["erro"] = None
+    st.session_state["resultados"] = resultados
+    st.session_state["parametros"] = params
 
-# --------------------------------------------------------------------------- sidebar: parametros financeiros
 
-st.sidebar.header("Parametros financeiros")
-st.sidebar.caption("Aplicados ao vivo (sem retreinar o modelo).")
+# --------------------------------------------------------------------------- primeiro carregamento
 
-canal_custos = {}
-for canal, default in CANAL_CUSTOS.items():
-    canal_custos[canal] = st.sidebar.number_input(
-        f"Custo {canal} (R$)", min_value=0.0, value=float(default), step=0.01, format="%.3f", key=f"custo_{canal}"
-    )
+if "resultados" not in st.session_state:
+    executar_pipeline(DEFAULTS)
 
-st.sidebar.subheader("Estrategia de canal")
-estrategia_modo = st.sidebar.radio(
-    "Estrategia de canal",
-    [
-        "Automatica (maximizar lucro)",
-        "Automatica (maximizar ROI)",
-        "Manual (mapeamento por faixa)",
-    ],
-    label_visibility="collapsed",
-)
+# --------------------------------------------------------------------------- sidebar
 
-canal_por_faixa = {"em_dia": None}
-if estrategia_modo == "Manual (mapeamento por faixa)":
-    for faixa in FAIXAS_DELINQUENTES:
-        default_canal = CANAL_POR_FAIXA.get(faixa, "sms")
-        canal_por_faixa[faixa] = st.sidebar.selectbox(
-            f"Faixa {faixa}", CANAIS, index=CANAIS.index(default_canal), key=f"canal_{faixa}"
-        )
-else:
-    st.sidebar.caption(
-        "Canal escolhido automaticamente por faixa (ver aba Estrategia financeira)."
-    )
+st.sidebar.title("collscore")
 
-st.sidebar.subheader("Saldo minimo elegivel")
-saldo_minimo_elegivel = {}
-for canal, default in SALDO_MINIMO_ELEGIVEL.items():
-    saldo_minimo_elegivel[canal] = st.sidebar.number_input(
-        f"Piso {canal} (R$)", min_value=0.0, value=float(default), step=100.0, format="%.3f", key=f"piso_{canal}"
-    )
-
-st.sidebar.subheader("Efetividade (canal x faixa)")
-st.sidebar.caption(
-    "Proxy de resposta diferencial por celula canal x faixa (caixa incremental x "
-    "efetividade) -- valores ARBITRADOS, nao estimados de dados; passo intermediario "
-    "ate uma modelagem causal de uplift. As conclusoes sobre qual canal vence sao "
-    "sensiveis a esses numeros -- edite a matriz para uma analise de sensibilidade."
-)
-matriz_efetividade_base = pd.DataFrame(
-    {faixa: [EFETIVIDADE[canal].get(faixa, 0.0) for canal in CANAIS] for faixa in FAIXAS_DELINQUENTES},
-    index=CANAIS,
-)
-matriz_efetividade_editada = st.sidebar.data_editor(
-    matriz_efetividade_base,
-    column_config={
-        faixa: st.column_config.NumberColumn(faixa, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
-        for faixa in FAIXAS_DELINQUENTES
-    },
-    num_rows="fixed",
-    key="matriz_efetividade",
+st.sidebar.download_button(
+    "Baixar template CSV",
+    data=gerar_template_csv(),
+    file_name="template_collscore.csv",
+    mime="text/csv",
     width="stretch",
 )
-efetividade = {
-    canal: {
-        faixa: float(np.clip(matriz_efetividade_editada.loc[canal, faixa], 0.0, 1.0))
-        for faixa in FAIXAS_DELINQUENTES
+
+with st.sidebar.form("parametros_form"):
+    st.header("Fonte de dados")
+    fonte = st.radio("Fonte", [FONTE_SIMULADA, FONTE_UPLOAD])
+
+    st.subheader("Base de exemplo (simulada)")
+    n_contratos = st.slider("n_contratos", 5000, 50_000, DEFAULTS["n_contratos"], step=1000)
+    n_snapshots = st.slider("n_snapshots", 6, 12, DEFAULTS["n_snapshots"])
+    st.caption("Burn-in = metade dos snapshots, aplicado ao clicar em 'Aplicar e rodar modelo'.")
+
+    st.subheader("Upload de base propria (CSV ou Parquet)")
+    arquivo = st.file_uploader("Painel", type=["csv", "parquet"])
+    st.caption("Colunas obrigatorias: " + ", ".join(REQUIRED_UPLOAD_COLS))
+
+    st.header("Parametros financeiros")
+    canal_custos_form = {}
+    for canal, default in CANAL_CUSTOS.items():
+        canal_custos_form[canal] = st.number_input(
+            f"Custo {canal} (R$)", min_value=0.0, value=float(default), step=0.01, format="%.3f", key=f"custo_{canal}"
+        )
+
+    st.subheader("Estrategia de canal")
+    estrategia_modo = st.radio(
+        "Estrategia de canal",
+        [
+            "Automatica (maximizar lucro)",
+            "Automatica (maximizar ROI)",
+            "Manual (mapeamento por faixa)",
+        ],
+        label_visibility="collapsed",
+    )
+
+    st.subheader("Canal por faixa (usado apenas no modo Manual)")
+    canal_por_faixa_manual = {"em_dia": None}
+    for faixa in FAIXAS_DELINQUENTES:
+        default_canal = CANAL_POR_FAIXA.get(faixa, "sms")
+        canal_por_faixa_manual[faixa] = st.selectbox(
+            f"Faixa {faixa}", CANAIS, index=CANAIS.index(default_canal), key=f"canal_{faixa}"
+        )
+
+    st.subheader("Saldo minimo elegivel")
+    saldo_minimo_elegivel_form = {}
+    for canal, default in SALDO_MINIMO_ELEGIVEL.items():
+        saldo_minimo_elegivel_form[canal] = st.number_input(
+            f"Piso {canal} (R$)", min_value=0.0, value=float(default), step=100.0, format="%.3f", key=f"piso_{canal}"
+        )
+
+    st.subheader("Efetividade (canal x faixa)")
+    st.caption(
+        "Proxy de resposta diferencial por celula canal x faixa -- valores ARBITRADOS, "
+        "nao estimados de dados; passo intermediario ate uma modelagem causal de uplift."
+    )
+    matriz_efetividade_base = pd.DataFrame(
+        {faixa: [EFETIVIDADE[canal].get(faixa, 0.0) for canal in CANAIS] for faixa in FAIXAS_DELINQUENTES},
+        index=CANAIS,
+    )
+    matriz_efetividade_editada = st.data_editor(
+        matriz_efetividade_base,
+        column_config={
+            faixa: st.column_config.NumberColumn(faixa, min_value=0.0, max_value=1.0, step=0.05, format="%.2f")
+            for faixa in FAIXAS_DELINQUENTES
+        },
+        num_rows="fixed",
+        key="matriz_efetividade",
+        width="stretch",
+    )
+
+    submitted = st.form_submit_button("Aplicar e rodar modelo", width="stretch")
+
+if submitted:
+    efetividade_form = {
+        canal: {
+            faixa: float(np.clip(matriz_efetividade_editada.loc[canal, faixa], 0.0, 1.0))
+            for faixa in FAIXAS_DELINQUENTES
+        }
+        for canal in CANAIS
     }
-    for canal in CANAIS
-}
+    params = dict(
+        fonte=fonte,
+        n_contratos=n_contratos,
+        n_snapshots=n_snapshots,
+        burn_in=n_snapshots // 2,
+        seed=42,
+        arquivo_bytes=arquivo.getvalue() if arquivo is not None else None,
+        arquivo_nome=arquivo.name if arquivo is not None else None,
+        canal_custos=canal_custos_form,
+        estrategia_modo=estrategia_modo,
+        canal_por_faixa_manual=canal_por_faixa_manual,
+        saldo_minimo_elegivel=saldo_minimo_elegivel_form,
+        efetividade=efetividade_form,
+        target_col=TARGET_COL,
+    )
+    executar_pipeline(params)
 
 # --------------------------------------------------------------------------- corpo principal
 
 st.title("collscore -- collection scoring e regularizacao financeira")
 
-if erro_pipeline is not None:
-    st.error("Nao foi possivel montar o pipeline:")
-    for e in erro_pipeline if isinstance(erro_pipeline, list) else [erro_pipeline]:
+if st.session_state.get("erro"):
+    st.error("Nao foi possivel montar o pipeline com os ultimos parametros aplicados:")
+    for e in st.session_state["erro"]:
         st.error(f"- {e}")
+
+resultados = st.session_state.get("resultados")
+parametros = st.session_state.get("parametros", DEFAULTS)
+
+if resultados is None:
+    st.info("Ajuste os parametros na barra lateral e clique em 'Aplicar e rodar modelo'.")
     st.stop()
 
-if pipeline is None:
-    st.info("Envie um arquivo no painel lateral para continuar.")
-    st.stop()
+st.caption(
+    f"Resultados vigentes: fonte = {parametros.get('fonte')} &middot; "
+    f"estrategia de canal = {parametros.get('estrategia_modo')}"
+)
 
-resumo_exec = pipeline["resumo_exec"]
-rr_saldo = pipeline["rr_saldo"]
-ks_gini = pipeline["ks_gini"]
-ks_gini_faixa = pipeline["ks_gini_faixa"]
-dec = pipeline["decile"]
-test = pipeline["test"]
+resumo_exec = resultados["resumo_exec"]
+rr_saldo = resultados["rr_saldo"]
+ks_gini = resultados["ks_gini"]
+ks_gini_faixa = resultados["ks_gini_faixa"]
+dec = resultados["decile"]
+test = resultados["test"]
+
+# --------------------------------------------------------------------------- relatorio HTML
+
+if st.sidebar.button("Gerar relatorio HTML", width="stretch"):
+    st.session_state["relatorio_html"] = build_html_report(resultados, parametros)
+
+if "relatorio_html" in st.session_state:
+    st.sidebar.download_button(
+        "Baixar relatorio HTML",
+        data=st.session_state["relatorio_html"],
+        file_name="relatorio_modelo.html",
+        mime="text/html",
+        width="stretch",
+    )
 
 tab1, tab2, tab3, tab4 = st.tabs(
     ["Visao executiva", "Roll rate de saldo", "Score e decis", "Estrategia financeira"]
@@ -455,6 +555,11 @@ with tab3:
 
 # ---------------------------------------------------------------- tab 4: estrategia financeira
 with tab4:
+    canal_custos = parametros["canal_custos"]
+    saldo_minimo_elegivel = parametros["saldo_minimo_elegivel"]
+    efetividade = parametros["efetividade"]
+    estrategia_modo_atual = parametros["estrategia_modo"]
+
     st.caption(
         "Negativacao modela a inclusao em bureau de credito (Serasa/SPC). Por lei "
         "(CDC, art. 43) e exigida notificacao previa ao devedor antes da inclusao -- "
@@ -465,8 +570,8 @@ with tab4:
         "estimada de dados) e a comparacao abaixo e entre canais PUROS -- reguas reais "
         "de cobranca sao sequenciais (sms, depois negativacao, depois "
         "call_center/juridico). As conclusoes de qual canal vence podem se inverter "
-        "com outros valores: use a secao 'Efetividade (canal x faixa)' na sidebar para "
-        "uma analise de sensibilidade."
+        "com outros valores: ajuste a matriz na sidebar e clique em 'Aplicar e rodar "
+        "modelo' para uma analise de sensibilidade."
     )
 
     # ------------------------------------------------- comparacao canal x faixa
@@ -546,21 +651,16 @@ with tab4:
     # ------------------------------------------------------------- estrategia
     st.subheader("Estrategia escolhida")
 
-    if estrategia_modo == "Manual (mapeamento por faixa)":
-        canal_por_faixa_efetivo = canal_por_faixa
-    else:
-        criterio = "lucro" if "lucro" in estrategia_modo else "roi"
-        resultado_estrategia = optimal_strategy(
-            test,
-            criterio=criterio,
-            score_col="score",
-            target_col=TARGET_COL,
-            canal_custos=canal_custos,
-            saldo_minimo_elegivel=saldo_minimo_elegivel,
-            efetividade=efetividade,
-        )
-        estrategia_df = resultado_estrategia["estrategia"]
-        canal_por_faixa_efetivo = {"em_dia": None, **dict(zip(estrategia_df["faixa_atraso"], estrategia_df["canal"]))}
+    canal_por_faixa_efetivo = resolve_canal_por_faixa(
+        test,
+        normalizar_estrategia_modo(estrategia_modo_atual),
+        parametros["canal_por_faixa_manual"],
+        score_col="score",
+        target_col=TARGET_COL,
+        canal_custos=canal_custos,
+        saldo_minimo_elegivel=saldo_minimo_elegivel,
+        efetividade=efetividade,
+    )
 
     curva_lucro, resumo_otimo = run_finance_analysis(
         test,

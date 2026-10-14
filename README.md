@@ -15,9 +15,13 @@ centrada em regularizacao (pagamento de parcela). Inclui um pipeline CLI
   + dummies de faixa de atraso), sem binning WoE.
 - `collscore/metrics.py` -- metricas de regularizacao financeira por faixa,
   roll rate de saldo, decis de score, KS/Gini.
-- `collscore/finance.py` -- custo por canal, piso de saldo elegivel, curva
-  de lucro e corte otimo por faixa.
-- `run_demo.py` -- pipeline ponta a ponta que gera `relatorio.md`.
+- `collscore/finance.py` -- custo por canal, piso de saldo elegivel, matriz
+  de efetividade canal x faixa, curva de lucro, escolha endogena de canal
+  (`compare_channels`/`optimal_strategy`) e fronteira orcamento x lucro.
+- `collscore/report.py` -- relatorio HTML autocontido de desenvolvimento e
+  validacao do modelo (`build_html_report`).
+- `run_demo.py` -- pipeline ponta a ponta que gera `relatorio.md` e
+  `relatorio_modelo.html`.
 - `app.py` -- app Streamlit interativo sobre o mesmo pacote.
 - `tests/` -- suite pytest.
 
@@ -39,19 +43,29 @@ python run_demo.py --n-contratos 50000 --seed 42 --output relatorio.md
 streamlit run app.py
 ```
 
-O app abre em `http://localhost:8501`. Na barra lateral e possivel escolher
-entre:
+O app abre em `http://localhost:8501`. Todos os controles (fonte de dados,
+upload, custos por canal, estrategia de canal, pisos de saldo, matriz de
+efetividade) ficam dentro de um formulario na barra lateral -- nada
+recalcula automaticamente. So ao clicar em **"Aplicar e rodar modelo"** o
+pipeline (simulacao/upload -> features -> target -> treino -> metricas ->
+financas) roda e os resultados ficam guardados em `st.session_state`; as
+abas renderizam exclusivamente a partir dali. No primeiro carregamento, o
+app roda uma vez com os defaults para nao abrir vazio.
 
-- **Base de exemplo (simulada)**: ajusta `n_contratos` e `n_snapshots` via
-  sliders; a simulacao e o treino do modelo ficam em cache
-  (`st.cache_data`).
+- **Base de exemplo (simulada)**: `n_contratos` e `n_snapshots` via sliders;
+  a simulacao e o treino do modelo ficam em cache (`st.cache_data`) para
+  submits repetidos com os mesmos parametros.
 - **Upload de base propria**: envia um CSV ou Parquet no formato de painel
   com as colunas `id_contrato, snapshot, faixa_atraso, saldo_devedor,
   saldo_atraso, parcela_valor, parcelas_pagas, parcelas_vencidas`. Um botao
-  "Baixar template CSV" gera um exemplo no layout esperado.
+  "Baixar template CSV" (fora do formulario) gera um exemplo no layout
+  esperado.
 
-Os parametros financeiros (custo por canal, canal por faixa, saldo minimo
-elegivel) sao aplicados ao vivo, sem precisar retreinar o modelo.
+Um botao **"Gerar relatorio HTML"** (fora do formulario, usa os resultados
+vigentes) produz um relatorio de desenvolvimento e validacao autocontido
+(objetivo, base de dados, target, variaveis, metodologia, desempenho,
+estabilidade, uso financeiro ilustrativo do score e limitacoes), disponivel
+para download logo em seguida.
 
 ## Testes
 

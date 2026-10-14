@@ -403,3 +403,26 @@ def fronteira_orcamento_lucro(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(linhas)
+
+
+def resolve_canal_por_faixa(
+    df: pd.DataFrame,
+    modo: str,
+    canal_por_faixa_manual: dict | None = None,
+    **kwargs,
+) -> dict:
+    """Resolve o mapeamento faixa->canal efetivamente em uso, dado o modo de
+    estrategia: "manual" retorna `canal_por_faixa_manual` (ou
+    `CANAL_POR_FAIXA` se None); "lucro"/"roi" derivam o mapeamento do canal
+    vencedor por faixa via `optimal_strategy`. Usado tanto pelo app quanto
+    pelo relatorio HTML para que os dois apliquem exatamente a mesma regra.
+    """
+    if modo == "manual":
+        return canal_por_faixa_manual or CANAL_POR_FAIXA
+
+    if modo not in ("lucro", "roi"):
+        raise ValueError("modo deve ser 'manual', 'lucro' ou 'roi'")
+
+    resultado = optimal_strategy(df, criterio=modo, **kwargs)
+    estrategia_df = resultado["estrategia"]
+    return {"em_dia": None, **dict(zip(estrategia_df["faixa_atraso"], estrategia_df["canal"]))}

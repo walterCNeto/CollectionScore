@@ -64,6 +64,40 @@ def resumo_regularizacao(
     return out.sort_values("_ordem").drop(columns="_ordem").reset_index(drop=True)
 
 
+def taxas_evento_por_faixa(
+    df: pd.DataFrame,
+    target_cols: list[str],
+    faixa_col: str = "faixa_atraso",
+) -> pd.DataFrame:
+    """Taxa media de cada coluna de `target_cols` por faixa de atraso (+
+    linha TOTAL). Cada coluna e tratada com seu proprio dropna (os targets
+    podem ter padroes de nulos distintos). Util para comparar o target
+    escolhido com alternativas (ex.: `pagou_1parcela` vs `cura_total` vs
+    `melhora_faixa`).
+    """
+    ordem = {f: i for i, f in enumerate(FAIXAS)}
+    faixas_presentes = sorted(
+        df[faixa_col].dropna().unique(), key=lambda f: ordem.get(f, len(FAIXAS))
+    )
+
+    linhas = []
+    for faixa in faixas_presentes:
+        sub = df[df[faixa_col] == faixa]
+        linha = {faixa_col: faixa}
+        for col in target_cols:
+            validos = sub[col].dropna()
+            linha[col] = _round(validos.mean()) if len(validos) > 0 else float("nan")
+        linhas.append(linha)
+
+    linha_total = {faixa_col: "TOTAL"}
+    for col in target_cols:
+        validos = df[col].dropna()
+        linha_total[col] = _round(validos.mean()) if len(validos) > 0 else float("nan")
+    linhas.append(linha_total)
+
+    return pd.DataFrame(linhas)
+
+
 def roll_rate_saldo(
     panel: pd.DataFrame,
     faixa_col: str = "faixa_atraso",
